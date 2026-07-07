@@ -1,0 +1,69 @@
+# Quick-completion test for the PyTorch port.
+# Same physics as example_config_small.yaml but with a lenient stop condition
+# (-0.2 instead of -0.95) that triggers as soon as the magnetization switches,
+# so the full run (including the "Final state" output path) finishes fast.
+physics:
+  magnetic:
+    ms: 1.25e+6
+    exchange_stiffness: 1.0e-11
+    anisotropy_k1: 958.0
+  elastic:
+    c11: 240.0e+9
+    c12: 89.0e+9
+    c44: 76.0e+9
+  magnetostriction:
+    lambda100: 10.0e-6
+    lambda111: 30.9e-6
+  demagnetization:
+    n_x: 0.0
+    n_y: 0.0
+    n_z: 1.0
+  external_field:
+    hext1: 200.0
+    dhext1: 80.0
+    hext2: 0.01
+    dhext2: 0.0
+    hext3: 0.0
+    dhext3: 0.0
+  external_stress:
+    sigma11: 0.0
+    sigma22: 0.0
+    sigma33: 0.0
+    sigma12: 0.0
+    sigma23: 0.0
+    sigma13: 0.0
+  rotation_111: false
+  magnetoelastic_coupling: false
+  characteristic_length: 10.0e-9
+
+grid:
+  type: "Hex"
+  cubic_mesh:
+    nx: 16
+    ny: 16
+    nz: 8
+    ndx: 4
+    ndy: 4
+    ndz: 4
+
+simulation:
+  precision: "DP"
+  llg:
+    timestep: 3.0e-12
+    alpha_damping: 0.15
+    llg_accuracy_factor: 5.0e-10
+  solver:
+    tolerance: 1.0e-7
+    max_iterations: 5000
+    initial_factor: 100.0
+  restart: false
+  initial_magnetization: [1.0, 0.0, 0.0]
+  stop_condition:
+    direction: [0.8, 0.6, 0.0]
+    value: -0.2
+
+output:
+  directory: "test_output_quick"
+  write_magnetization: true
+  save_frequency: 1000
+  vtu_blend_alpha: 0.05
