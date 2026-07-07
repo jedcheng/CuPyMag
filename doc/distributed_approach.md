@@ -168,7 +168,7 @@ the largest) by ~1/P, unlocking problem sizes a single GPU cannot hold.
 |---|---|---|
 | **0** | Serial prep: de-sync the CG loop (device-side scalars, periodic single-boolean convergence checks), add multi-RHS (batched) support to `solve_cg`. Improves single-GPU performance; prerequisite for distribution. | **done** |
 | **1** | Hex mesh, correctness: replicated CPU assembly → per-rank row-block extraction + halo maps → distributed SpMV/CG/reductions → rank-0 I/O. Validate against serial with tolerance-vs-world-size methodology (cf. `sp4_with_comparison.py`). | **done** |
-| **2** | Performance: fused/single-reduction CG, comm–compute overlap, use multi-RHS CG for the 3-RHS groups in `Micromagnetics.py`, benchmark with the synthetic-scaling protocol from the paper. | planned |
+| **2** | Performance: fused/single-reduction CG, comm–compute overlap, use multi-RHS CG for the 3-RHS groups in `Micromagnetics.py`, benchmark with the synthetic-scaling protocol from the paper. | **done** (GPU/multi-node benchmark pending) |
 | **3** | Generality: Tet/METIS path, distributed elasticity, block-Jacobi preconditioning, parallel VTU output. | planned |
 
 ### Phase 1 details (implemented)
@@ -235,10 +235,59 @@ double precision, `doc/prototypes/test_dist_ops.py` + full-simulation runs):
 As predicted, wall time at this tiny, latency-bound size is *worse* than
 serial (serial 206 s / 8 threads; 2 ranks 353 s; 4 ranks 313 s): each LLG
 step issues ~2,600 blocking all-reduces plus ~1,300 two-phase halo
-exchanges. This is the Phase 2 target (fused single-reduction CG, multi-RHS
-batching of the 3-RHS solve groups, comm–compute overlap); the scaling
-payoff is expected at large meshes, mirroring the halo-bound exchange-field
-result in the paper.
+exchanges. This motivated Phase 2; the scaling payoff is expected at large
+meshes, mirroring the halo-bound exchange-field result in the paper.
+
+### Phase 2 details (implemented)
+
+Communication-count reductions in the distributed backend:
+
+- **Single-reduction CG** (`ops.solve_cg`): replaced textbook CG with the
+  Chronopoulos–Gear variant — per iteration one SpMV (`w = A r`) and **one**
+  fused `all_reduce` carrying both dot products (γ = rᵀr, δ = wᵀr), vs two
+  reductions before. Same API/semantics (multi-RHS, per-column breakdown
+  freezing, `check_every`, explicit final residual check guarding the
+  recurrence drift).
+- **Comm–compute overlap**: `XSlabPartition.extract_row_block` now splits
+  each row block into `A_own` (owned columns) and `A_ghost` (ghost columns);
+  `DistSparseMat.matmul` posts the halo exchange, computes `A_own @ x`
+  while it is in flight, then adds `A_ghost @ ghosts`. For world_size ≥ 3
+  all four P2P ops go in one non-blocking batch; world_size == 2 keeps the
+  sequential two-phase form (message-matching ambiguity).
+- **Batched solve groups + shared exchanges** (`micromagnetics.py`): the
+  `g1n/g2n/g3n` solves (shared `A1`) and `m*starstar` solves (shared `A2`)
+  run as single 3-RHS batched CG calls with stacked warm starts; the three
+  RHS SpMVs on `m_tilde`, the three derivative SpMVs on `U`, and
+  `F1 @ [f1,f2,f3]` each share one halo exchange (`matmul_with_ghosts`).
+  Per LLG step: 5 CG solve calls instead of 9, and roughly 4× fewer
+  collectives per solve-iteration in the batched groups.
+
+**Phase 2 validation and timings** (same quick-config protocol; note the
+login node is shared, ±10% noise):
+
+| Run | Phase 1 | Phase 2 |
+|---|---|---|
+| serial (8 threads) | 206 s | — |
+| 1 rank (distributed path) | — | 303 s |
+| 2 ranks × 4 threads | 353 s | 315 s (−11%) |
+| 4 ranks × 2 threads | 313 s | 309 s |
+
+- **Variant isolation:** the 1-rank run (zero communication) matches serial
+  at all 58 fields (≤ 1.5e-3, final switched state only) — the C–G variant
+  introduces only tol-level trajectory differences, no bifurcation.
+- 2- and 4-rank runs agree with *each other* to ~1e-5 and match serial
+  everywhere except the known marginal zone (H ≈ −2040 A/m flips to the
+  nearby metastable state, |Δavg_m| = 3.2e-2, trajectories re-merge) —
+  reduction-order sensitivity, same class as Phase 1's 4-rank flip.
+- The modest CPU-side gains are expected: on-node Intel-MPI all-reduce
+  latency is ~1–2 µs, so collective count is not yet dominant; the same
+  reductions target NCCL/multi-node latencies (~20–50 µs) where they
+  should matter proportionally more. Two known trade-offs to revisit on
+  GPU: batched 3-RHS CG iterates all columns until the slowest converges
+  (extra SpMV work when column iteration counts are unbalanced), and the
+  1-rank distributed path carries ~45% overhead vs the serial main loop
+  (no-op collectives + C-G bookkeeping) — worth profiling on H100 before
+  the scaling study.
 
 ## 6. Eliminating numba (explored, prototype validated)
 

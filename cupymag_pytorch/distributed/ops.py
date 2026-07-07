@@ -1,5 +1,5 @@
 # Copyright (c) 2025-2026 Hongyi Guan
-# PyTorch port of CuPyMag — distributed backend (Phase 1)
+# PyTorch port of CuPyMag — distributed backend (Phase 1/2)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,19 +15,20 @@
 
 """Distributed sparse operators, CG solver, and volume average.
 
-``DistSparseMat`` wraps a rank-local row block (ghost-extended columns)
-and performs halo exchange + SpMV under the same ``A @ v`` calling
-convention as the serial ``SparseMat``.
+``DistSparseMat`` wraps a rank-local row block split into an owned-column
+part and a ghost-column part; the halo exchange is posted before the
+owned-part SpMV so communication overlaps computation (world_size >= 3).
 
-``solve_cg`` mirrors ``cupymag_pytorch.solvers.linear_solvers.solve_cg``
-(including multi-RHS batching, breakdown freezing and ``check_every``)
-with one change: column-wise dot products are globally reduced with
-``all_reduce(SUM)``, so every rank sees identical scalars and takes
-identical branches.
+``solve_cg`` uses the Chronopoulos–Gear single-reduction CG variant: per
+iteration one SpMV (``w = A r``) and ONE fused ``all_reduce`` carrying
+both dot products (vs two reductions for textbook CG), with the same
+multi-RHS batching, per-column breakdown freezing, and ``check_every``
+host-sync throttling as the serial Phase 0 solver. Every rank sees
+identical reduced scalars and takes identical branches.
 
 ``DistVolumeAverage`` evaluates the Gauss-quadrature average on the
-rank-local element slice (using the exact same per-element quadrature
-data as the serial class) and reduces the integral and volume globally.
+rank-local element slice (same per-element quadrature data as the serial
+class) and reduces the integral and volume globally.
 """
 
 import torch
@@ -38,35 +39,42 @@ from cupymag_pytorch.utils.volume_average import VolumeAverage
 
 
 class DistSparseMat:
-    """Row-block sparse CSR matrix with ghost-extended columns."""
+    """Row-block sparse CSR matrix, columns split into [owned | ghosts]."""
 
-    def __init__(self, local_csr_tensor, part: XSlabPartition):
-        self.t = local_csr_tensor
+    def __init__(self, A_own, A_ghost, part: XSlabPartition):
+        self.t = A_own  # (n_own, n_own); also the device/dtype reference
+        self.g = A_ghost  # (n_own, 2*plane) or None (single rank)
         self.part = part
 
     @classmethod
     def from_scipy_global(cls, A_scipy_csr, part: XSlabPartition):
-        return cls(part.extract_row_block(A_scipy_csr.tocsr()), part)
+        A_own, A_ghost = part.extract_row_block(A_scipy_csr.tocsr())
+        return cls(A_own, A_ghost, part)
 
     @property
     def shape(self):
         return self.t.shape
 
+    def matmul_with_ghosts(self, v, ghosts):
+        """SpMV given an already-exchanged (2*plane, k) ghost block."""
+        y = torch.sparse.mm(self.t, v)
+        if self.g is not None:
+            y = y + torch.sparse.mm(self.g, ghosts)
+        return y
+
     def matmul(self, v):
-        v_ext = self.part.exchange_ghosts(v)
-        if v_ext.dim() == 1:
-            return torch.sparse.mm(self.t, v_ext.unsqueeze(1)).squeeze(1)
-        return torch.sparse.mm(self.t, v_ext)
+        squeeze = v.dim() == 1
+        if squeeze:
+            v = v.unsqueeze(1)
+        # Post the halo exchange, overlap it with the owned-column SpMV.
+        ctx = self.part.ghosts_start(v)
+        y = torch.sparse.mm(self.t, v)
+        if self.g is not None:
+            y = y + torch.sparse.mm(self.g, self.part.ghosts_finish(ctx))
+        return y.squeeze(1) if squeeze else y
 
     def __matmul__(self, v):
         return self.matmul(v)
-
-
-def _dots(a, b):
-    """Column-wise dot products reduced over all ranks: (n,k)x(n,k)->(k,)."""
-    d = torch.einsum("nk,nk->k", a, b)
-    dist.all_reduce(d, op=dist.ReduceOp.SUM)
-    return d
 
 
 def solve_cg(
@@ -80,59 +88,98 @@ def solve_cg(
     system=None,
     check_every=1,
 ):
-    """Distributed CG on row-partitioned ``A`` (see serial ``solve_cg``).
+    """Distributed single-reduction (Chronopoulos–Gear) CG.
 
-    ``b`` holds this rank's rows, 1-D ``(n_own,)`` or 2-D ``(n_own, k)``.
-    All ranks must call collectively; every rank returns its row block of
-    the solution.
+    Same API and semantics as the serial ``solve_cg`` (relative-residual
+    tolerance per column, multi-RHS batching, breakdown freezing, final
+    residual check with RuntimeError on failure). ``b`` holds this rank's
+    rows; all ranks must call collectively.
     """
     b = b.to(A.t.device)
     single_rhs = b.dim() == 1
     if single_rhs:
         b = b.unsqueeze(1)
 
-    b_norm_sq = _dots(b, b)  # (k,) identical on all ranks
-    tol_sq = (tol * tol) * b_norm_sq
-    nonzero = b_norm_sq > 0.0
-
     if use_init and x0 is not None:
         x = x0.detach().clone().to(A.t.device).to(b.dtype)
         if x.dim() == 1:
             x = x.unsqueeze(1)
-        x = x * nonzero
-        r = b - (A @ x)
+        cold = False
     else:
         x = torch.zeros_like(b)
-        r = b.clone()
+        cold = True
 
-    p = r.clone()
-    rs_old = _dots(r, r)
     zero = torch.zeros((), dtype=b.dtype, device=b.device)
     one = torch.ones((), dtype=b.dtype, device=b.device)
 
+    r = b.clone() if cold else b - (A @ x)
+    w = A @ r
+
+    # One fused reduction for ||b||^2, gamma = (r,r), delta = (w,r).
+    buf = torch.stack(
+        [
+            torch.einsum("nk,nk->k", b, b),
+            torch.einsum("nk,nk->k", r, r),
+            torch.einsum("nk,nk->k", w, r),
+        ]
+    )
+    dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+    b_norm_sq, gamma, delta = buf[0], buf[1], buf[2]
+
+    tol_sq = (tol * tol) * b_norm_sq
+    nonzero = b_norm_sq > 0.0
+    x = x * nonzero
+
+    p = torch.zeros_like(r)
+    s = torch.zeros_like(r)
+    alpha = torch.zeros_like(gamma)
+    gamma_prev = torch.ones_like(gamma)
+    beta = torch.zeros_like(gamma)
+
     if bool(nonzero.any()):
         for it in range(1, maxiter + 1):
-            Ap = A @ p
-            pAp = _dots(p, Ap)
+            if it == 1:
+                # nonzero mask: zero-RHS columns stay frozen at x = 0.
+                ok = (delta > 0.0) & nonzero
+                alpha = torch.where(ok, gamma / torch.where(ok, delta, one), zero)
+                beta = torch.zeros_like(gamma)
+            else:
+                pos = gamma_prev > 0.0
+                beta = torch.where(
+                    pos, gamma / torch.where(pos, gamma_prev, one), zero
+                )
+                ok = alpha > 0.0
+                denom = delta - beta * gamma / torch.where(ok, alpha, one)
+                ok = ok & (denom > 0.0)
+                alpha = torch.where(ok, gamma / torch.where(ok, denom, one), zero)
 
-            ok = pAp > 0.0
-            alpha = torch.where(ok, rs_old / torch.where(ok, pAp, one), zero)
-            x = x + alpha * p
-            r = r - alpha * Ap
-
-            rs_new = _dots(r, r)
-            pos = rs_old > 0.0
-            beta = torch.where(pos, rs_new / torch.where(pos, rs_old, one), zero)
+            # Frozen columns (ok == False) keep p, s, x, r unchanged.
             p = torch.where(ok, r + beta * p, p)
-            rs_old = rs_new
+            s = torch.where(ok, w + beta * s, s)  # s = A p by recurrence
+            x = x + alpha * p
+            r = r - alpha * s
+
+            w = A @ r
+            gamma_prev = gamma
+            buf = torch.stack(
+                [
+                    torch.einsum("nk,nk->k", r, r),
+                    torch.einsum("nk,nk->k", w, r),
+                ]
+            )
+            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+            gamma, delta = buf[0], buf[1]
 
             if it % check_every == 0 or it == maxiter:
-                still_running = ok & (rs_new > tol_sq)
+                still_running = ok & (gamma > tol_sq)
                 if not bool(still_running.any()):
                     break
 
+    # Final residual check (explicit, guards recurrence drift and
+    # frozen/broken-down columns).
     res = b - (A @ x)
-    res_sq = _dots(res, res)
+    res_sq = torch.einsum("nk,nk->k", res, res)
+    dist.all_reduce(res_sq, op=dist.ReduceOp.SUM)
     if bool((res_sq <= tol_sq).all()):
         return x.squeeze(1) if single_rhs else x
 

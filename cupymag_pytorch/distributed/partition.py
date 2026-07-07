@@ -150,10 +150,34 @@ class XSlabPartition:
     # ------------------------------------------------------------------
     # Row-block extraction
     # ------------------------------------------------------------------
+    def _to_torch_csr(self, B):
+        crow = torch.from_numpy(np.ascontiguousarray(B.indptr, dtype=np.int64)).to(
+            self.device
+        )
+        col = torch.from_numpy(np.ascontiguousarray(B.indices, dtype=np.int64)).to(
+            self.device
+        )
+        vals = (
+            torch.from_numpy(np.ascontiguousarray(B.data, dtype=np.float64))
+            .to(self.dtype)
+            .to(self.device)
+        )
+        return torch.sparse_csr_tensor(
+            crow, col, vals, B.shape, requires_grad=False
+        )
+
     def extract_row_block(self, A_scipy_csr):
         """Extract this rank's row block of a global (n_dof x n_dof) scipy
         CSR matrix, remapping columns into the ghost-extended local index
-        space. Returns a torch sparse CSR tensor of shape (n_own, n_ext)."""
+        space and splitting by column ownership.
+
+        Returns ``(A_own, A_ghost)`` torch sparse CSR tensors of shapes
+        (n_own, n_own) and (n_own, 2*plane); ``A_ghost`` is ``None`` for a
+        single rank. The split lets the ghost exchange overlap with the
+        ``A_own`` SpMV.
+        """
+        from scipy.sparse import csr_matrix
+
         B = A_scipy_csr[self.r0 : self.r1, :].tocsr()
         cols = self._remap[B.indices]
         if cols.size and cols.min() < 0:
@@ -163,20 +187,14 @@ class XSlabPartition:
                 f"the +-1-plane halo (e.g. global cols {bad[:10]}); x-slab "
                 "partitioning is not valid for this operator."
             )
-        crow = torch.from_numpy(np.ascontiguousarray(B.indptr, dtype=np.int64)).to(
-            self.device
+        Bm = csr_matrix(
+            (B.data, cols, B.indptr), shape=(self.n_own, self.n_ext)
         )
-        col = torch.from_numpy(np.ascontiguousarray(cols, dtype=np.int64)).to(
-            self.device
-        )
-        vals = (
-            torch.from_numpy(np.ascontiguousarray(B.data, dtype=np.float64))
-            .to(self.dtype)
-            .to(self.device)
-        )
-        return torch.sparse_csr_tensor(
-            crow, col, vals, (self.n_own, self.n_ext), requires_grad=False
-        )
+        if self.world_size == 1:
+            return self._to_torch_csr(Bm), None
+        A_own = self._to_torch_csr(Bm[:, : self.n_own].tocsr())
+        A_ghost = self._to_torch_csr(Bm[:, self.n_own :].tocsr())
+        return A_own, A_ghost
 
     # ------------------------------------------------------------------
     # Halo exchange
@@ -184,6 +202,68 @@ class XSlabPartition:
     def _p2p_round(self, ops):
         for req in dist.batch_isend_irecv(ops):
             req.wait()
+
+    def ghosts_start(self, x):
+        """Begin the halo exchange for 2-D ``x`` (n_own, k); returns an
+        opaque context for :meth:`ghosts_finish`.
+
+        For world_size >= 3 each directed rank pair carries one message,
+        so all four P2P ops are posted in a single non-blocking batch that
+        can overlap with local computation. For world_size == 2 both
+        neighbours are the same rank and the messages would cross-match,
+        so the two flow directions run as sequential blocking phases.
+        """
+        ps = self.plane
+        if self.world_size == 1:
+            return None
+
+        gl = torch.empty((ps, x.shape[1]), dtype=x.dtype, device=x.device)
+        gr = torch.empty_like(gl)
+        first = x[:ps].contiguous()
+        last = x[-ps:].contiguous()
+
+        if self.world_size == 2:
+            # Phase A: rightward flow; Phase B: leftward flow (blocking).
+            self._p2p_round(
+                [
+                    dist.P2POp(dist.isend, last, self.right),
+                    dist.P2POp(dist.irecv, gl, self.left),
+                ]
+            )
+            self._p2p_round(
+                [
+                    dist.P2POp(dist.isend, first, self.left),
+                    dist.P2POp(dist.irecv, gr, self.right),
+                ]
+            )
+            return (None, gl, gr, first, last)
+
+        reqs = dist.batch_isend_irecv(
+            [
+                dist.P2POp(dist.isend, last, self.right),
+                dist.P2POp(dist.irecv, gl, self.left),
+                dist.P2POp(dist.isend, first, self.left),
+                dist.P2POp(dist.irecv, gr, self.right),
+            ]
+        )
+        # Keep references to the send buffers until the wait.
+        return (reqs, gl, gr, first, last)
+
+    def ghosts_finish(self, ctx):
+        """Complete a :meth:`ghosts_start` exchange; returns the (2*plane, k)
+        ghost block [left plane; right plane], or ``None`` for 1 rank."""
+        if ctx is None:
+            return None
+        reqs, gl, gr, _, _ = ctx
+        if reqs is not None:
+            for req in reqs:
+                req.wait()
+        return torch.cat([gl, gr], dim=0)
+
+    def get_ghosts(self, x):
+        """Blocking halo exchange for 2-D ``x``: returns the (2*plane, k)
+        ghost block, or ``None`` for 1 rank."""
+        return self.ghosts_finish(self.ghosts_start(x))
 
     def exchange_ghosts(self, x):
         """Return the ghost-extended vector [x | left ghost | right ghost].
@@ -199,26 +279,8 @@ class XSlabPartition:
         if squeeze:
             x = x.unsqueeze(1)
 
-        ps = self.plane
-        gl = torch.empty((ps, x.shape[1]), dtype=x.dtype, device=x.device)
-        gr = torch.empty_like(gl)
-
-        # Phase A: rightward flow (send my last plane right, recv from left).
-        self._p2p_round(
-            [
-                dist.P2POp(dist.isend, x[-ps:].contiguous(), self.right),
-                dist.P2POp(dist.irecv, gl, self.left),
-            ]
-        )
-        # Phase B: leftward flow (send my first plane left, recv from right).
-        self._p2p_round(
-            [
-                dist.P2POp(dist.isend, x[:ps].contiguous(), self.left),
-                dist.P2POp(dist.irecv, gr, self.right),
-            ]
-        )
-
-        x_ext = torch.cat([x, gl, gr], dim=0)
+        ghosts = self.get_ghosts(x)
+        x_ext = torch.cat([x, ghosts], dim=0)
         return x_ext.squeeze(1) if squeeze else x_ext
 
     def extend_right(self, x):

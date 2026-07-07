@@ -200,14 +200,10 @@ def main():
     m_prev = m.clone()
 
     U = None
-    g1n = None
-    g2n = None
-    g3n = None
+    Gn = None  # batched g1n/g2n/g3n warm start (n_own, 3)
     g1star = None
     g2star = None
-    m1starstar = None
-    m2starstar = None
-    m3starstar = None
+    Mss = None  # batched m*starstar warm start (n_own, 3)
 
     hyst_file = None
     if root:
@@ -258,7 +254,13 @@ def main():
         # ME is not supported: strains are zero on the local rows.
         E = torch.zeros((part.n_own, 6), dtype=float_cp, device=DEVICE)
 
-        b_demag = -(Fx @ m_tilde[:, 0] + Fy @ m_tilde[:, 1] + Fz @ m_tilde[:, 2])
+        # One shared halo exchange for the three F SpMVs on m_tilde.
+        gh = part.get_ghosts(m_tilde)
+        b_demag = -(
+            Fx.matmul_with_ghosts(m_tilde[:, 0:1], None if gh is None else gh[:, 0:1])
+            + Fy.matmul_with_ghosts(m_tilde[:, 1:2], None if gh is None else gh[:, 1:2])
+            + Fz.matmul_with_ghosts(m_tilde[:, 2:3], None if gh is None else gh[:, 2:3])
+        ).squeeze(1)
         # Pin a DOF to 0 here instead of assembly process
         if part.owns_dof0:
             b_demag[0] = 0.0
@@ -272,9 +274,12 @@ def main():
             use_init=use_init,
         )
 
-        Htilde1 = -(Fx @ U)
-        Htilde2 = -(Fy @ U)
-        Htilde3 = -(Fz @ U)
+        # One shared halo exchange for the three derivative SpMVs on U.
+        U2 = U.unsqueeze(1)
+        ghU = part.get_ghosts(U2)
+        Htilde1 = -Fx.matmul_with_ghosts(U2, ghU).squeeze(1)
+        Htilde2 = -Fy.matmul_with_ghosts(U2, ghU).squeeze(1)
+        Htilde3 = -Fz.matmul_with_ghosts(U2, ghU).squeeze(1)
         Hbar1 = -N_x * avg_m[0]
         Hbar2 = -N_y * avg_m[1]
         Hbar3 = -N_z * avg_m[2]
@@ -321,41 +326,22 @@ def main():
             f2 = v[:, 1] + 0.5 * Hbar2 + 0.5 * Htilde2 + Hext2
             f3 = v[:, 2] + 0.5 * Hbar3 + 0.5 * Htilde3 + Hext3
 
-        f1temp = f1 * dt + m[:, 0]
-        f2temp = f2 * dt + m[:, 1]
-        f3temp = f3 * dt + m[:, 2]
+        # Batched 3-RHS solve: g1n/g2n/g3n share A1 (one exchange for the
+        # RHS SpMV, and each CG iteration's collectives amortize over the
+        # three columns).
+        Ftemp = torch.stack([f1 * dt + m[:, 0], f2 * dt + m[:, 1], f3 * dt + m[:, 2]], dim=1)
+        B_gn = F1 @ Ftemp
 
-        b_g1n = F1 @ f1temp
-        b_g2n = F1 @ f2temp
-        b_g3n = F1 @ f3temp
-
-        g1n = solve_cg(
+        Gn = solve_cg(
             A1,
-            b_g1n,
-            x0=g1n,
+            B_gn,
+            x0=Gn,
             tol=tol,
             maxiter=maxiter,
-            system="Gauss-Seidel g1n",
+            system="Gauss-Seidel g1n/g2n/g3n",
             use_init=use_init,
         )
-        g2n = solve_cg(
-            A1,
-            b_g2n,
-            x0=g2n,
-            tol=tol,
-            maxiter=maxiter,
-            system="Gauss-Seidel g2n",
-            use_init=use_init,
-        )
-        g3n = solve_cg(
-            A1,
-            b_g3n,
-            x0=g3n,
-            tol=tol,
-            maxiter=maxiter,
-            system="Gauss-Seidel g3n",
-            use_init=use_init,
-        )
+        g1n, g2n, g3n = Gn[:, 0], Gn[:, 1], Gn[:, 2]
 
         m1star = m[:, 0] + g2n * m[:, 2] - g3n * m[:, 1]
         f1temp = f1 * dt + m1star
@@ -428,38 +414,19 @@ def main():
             f2temp = (v[:, 1] + 0.5 * Hbar2 + 0.5 * Htilde2 + Hext2) * dt2 + m2star
             f3temp = (v[:, 2] + 0.5 * Hbar3 + 0.5 * Htilde3 + Hext3) * dt2 + m3star
 
-        b_gstar = F1 @ f1temp
-        m1starstar = solve_cg(
+        # Batched 3-RHS solve: the m*starstar systems share A2.
+        Ftemp = torch.stack([f1temp, f2temp, f3temp], dim=1)
+        B_ss = F1 @ Ftemp
+        Mss = solve_cg(
             A2,
-            b_gstar,
-            x0=m1starstar,
+            B_ss,
+            x0=Mss,
             tol=tol,
             maxiter=maxiter,
-            system="Gauss-Seidel m1starstar",
+            system="Gauss-Seidel m*starstar",
             use_init=use_init,
         )
-
-        b_gstar = F1 @ f2temp
-        m2starstar = solve_cg(
-            A2,
-            b_gstar,
-            x0=m2starstar,
-            tol=tol,
-            maxiter=maxiter,
-            system="Gauss-Seidel m2starstar",
-            use_init=use_init,
-        )
-
-        b_gstar = F1 @ f3temp
-        m3starstar = solve_cg(
-            A2,
-            b_gstar,
-            x0=m3starstar,
-            tol=tol,
-            maxiter=maxiter,
-            system="Gauss-Seidel m3starstar",
-            use_init=use_init,
-        )
+        m1starstar, m2starstar, m3starstar = Mss[:, 0], Mss[:, 1], Mss[:, 2]
 
         magnitude = torch.sqrt(m1starstar**2 + m2starstar**2 + m3starstar**2)
 
