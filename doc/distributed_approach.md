@@ -422,9 +422,38 @@ Wall time at this tiny size remains slower than serial (735 s vs 289 s at
 rest — GPU/multi-node is where the design targets).
 
 A PJM job-script template for the Genkai GPU-node NCCL scaling benchmark
-is at `doc/prototypes/genkai_gpu_job.sh` (verify rscgrp/gpu directives
-before submitting; the GPU path needs no source-built torch — stock CUDA
-wheels ship NCCL).
+is at `doc/prototypes/genkai_gpu_job.sh` (the GPU path needs no
+source-built torch — stock CUDA wheels ship NCCL).
+
+### GPU smoke test (H100 node, NCCL — quick config, 2048 DOFs)
+
+First interactive run on a Genkai GPU node (`doc/prototypes/log.txt`,
+rscgrp c-batch, cuda/12.2.2):
+
+| GPUs | total time | final avg m1 |
+|---|---|---|
+| 1 (serial main) | 329 s | −0.6978300335 |
+| 2 | 671 s | −0.6989541644 |
+| 4 | 630 s | −0.6989541644 |
+| 8 | 684 s | −0.6989541644 |
+
+- **Correctness:** the 2/4/8-GPU runs agree with each other to ~1e-10 and
+  their convergence traces match to 7 digits at every checkpoint —
+  essentially reproducible distributed trajectories across world sizes.
+  The ~1.1e-3 offset vs 1 GPU is the serial-main (textbook CG) vs
+  distributed (C–G variant) trajectory difference in the switched state,
+  same as on CPU. This validates the full NCCL code path, including the
+  8-rank case (2 planes/rank, the enforced minimum).
+- **Performance:** at 2048 DOFs everything is launch/collective latency —
+  one H100 loses to 8 CPU cores (329 vs 207 s), and multi-GPU is ~2×
+  single GPU, flat in P (256 DOFs/rank at P=8 amortizes nothing). The
+  quick config is a correctness smoke test only; the scaling signal needs
+  `doc/prototypes/config_bench_64.yaml` (131k DOFs) or larger.
+- **Cheap next win:** the CG loop still performs one GPU→host sync per
+  iteration for the convergence flag. `solver.check_every: N` in the YAML
+  (plumbed through both mains; default 1) fetches it every N iterations
+  instead — at ~10–20 µs per sync × thousands of iterations per LLG step,
+  this is likely a large fraction of the single-GPU 329 s.
 
 ### Phase 0 details (implemented)
 

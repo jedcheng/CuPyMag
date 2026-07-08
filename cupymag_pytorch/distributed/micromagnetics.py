@@ -318,6 +318,7 @@ def main():
                 maxiter=maxiter,
                 system="elasticity",
                 use_init=use_init,
+            check_every=cg_check_every,
             )
 
             U3 = u.view(3, part.n_own).T.contiguous()
@@ -378,6 +379,7 @@ def main():
             maxiter=maxiter,
             system="demag",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         # One shared halo exchange for the three derivative SpMVs on U.
@@ -472,6 +474,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel g1n/g2n/g3n",
             use_init=use_init,
+            check_every=cg_check_every,
         )
         g1n, g2n, g3n = Gn[:, 0], Gn[:, 1], Gn[:, 2]
 
@@ -486,6 +489,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel g1star",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         m2star = m[:, 1] + g3n * m1star - g1star * m[:, 2]
@@ -499,6 +503,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel g2star",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         m3star = m[:, 2] + g1star * m2star - g2star * m1star
@@ -582,6 +587,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel m*starstar",
             use_init=use_init,
+            check_every=cg_check_every,
         )
         m1starstar, m2starstar, m3starstar = Mss[:, 0], Mss[:, 1], Mss[:, 2]
 

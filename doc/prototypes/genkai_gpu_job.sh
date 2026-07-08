@@ -1,6 +1,6 @@
 #!/bin/bash
-#PJM -L rscgrp=b-batch
-#PJM -L node=1
+#PJM -L rscgrp=c-batch
+#PJM -L gpu=8
 #PJM -L elapse=1:00:00
 #PJM -j
 #
@@ -23,13 +23,17 @@
 # config below is the scaling workload — takes several minutes/field).
 
 module purge
+module load cuda/12.2.2
 
-source $SSD/venv/cupymag_gpu/bin/activate
-export PYTHONPATH=/fast/pj24001684/pytorch_mpi/CuPyMag
+source $SSD/venv/magnumnp_v2_dist_gpu/bin/activate
+export WKDIR=/fast/pj24001684/pytorch_mpi/CuPyMag
 
-cd $PJM_O_WORKDIR
+cd $WKDIR
 
-CONFIG_QUICK=/fast/pj24001684/pytorch_mpi/CuPyMag/examples/example_config_quick.yaml
+CONFIG_QUICK=$WKDIR/examples/example_config_quick.yaml
+
+CUDA_VISIBLE_DEVICES=0 python -m cupymag_pytorch --config $CONFIG_QUICK 
+
 
 # Correctness smoke test at 2 and 4 GPUs (compare hysteresis.txt vs a
 # serial run of the same config).
@@ -37,10 +41,18 @@ torchrun --standalone --nproc_per_node=2 -m cupymag_pytorch.distributed \
     $CONFIG_QUICK --backend=nccl
 torchrun --standalone --nproc_per_node=4 -m cupymag_pytorch.distributed \
     $CONFIG_QUICK --backend=nccl
+torchrun --standalone --nproc_per_node=8 -m cupymag_pytorch.distributed \
+    $CONFIG_QUICK --backend=nccl
 
-# Scaling workload: create a 64x64x32 variant of the quick config first
-# (nx/ny/nz + a fresh output directory), then:
-# for P in 1 2 4; do
+# Scaling workload: 64x64x32 (131k DOFs), with solver.check_every: 8 to
+# cut per-iteration GPU->host syncs. Compare the per-field "Time for LLG
+# calculation used" lines across P; let the elapse limit cut the sweep.
+# CONFIG_BENCH=$WKDIR/doc/prototypes/config_bench_64.yaml
+# for P in 1 2 4 8; do
 #     torchrun --standalone --nproc_per_node=$P -m cupymag_pytorch.distributed \
-#         config_bench_64.yaml --backend=nccl
+#         $CONFIG_BENCH --backend=nccl
 # done
+#
+# Also worth one measurement: the quick config with check_every: 8 at
+# 1 GPU, to quantify how much of the 329 s single-GPU smoke-test time was
+# host-sync latency.

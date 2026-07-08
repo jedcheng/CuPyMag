@@ -1,0 +1,60 @@
+1 GPU 
+Current average magnetization is m1 = 0.1741639373328444, m2 = 0.9219758093180888, m3 = -8.452505713381777e-05.
+Time for LLG calculation used: 288.94 s.
+Now calculating LLG with Hext1 = -4360 A/m.
+m diff L2 norm sq: 0.0000338235 at LLG step 200
+m diff L2 norm sq: 0.0000058019 at LLG step 400
+m diff L2 norm sq: 0.0000179315 at LLG step 600
+m diff L2 norm sq: 0.0007546877 at LLG step 800
+m diff L2 norm sq: 0.1603065011 at LLG step 1000
+Field written to /fast/pj24001684/pytorch_mpi/CuPyMag/examples/test_output_quick/field_-4360_1.vtu.
+Final state for average magnetization: m1 = -0.6978300335198558, m2 = 0.591830028766034, m3 = -0.02650423649399457.
+Field written to /fast/pj24001684/pytorch_mpi/CuPyMag/examples/test_output_quick/field_-4360_2.vtu.
+The code uses 329.32 s in total, 10.83 s for system set up, and 318.49 for LLG calculation.
+
+
+2 GPUs
+Current average magnetization is m1 = 0.17416198324819632, m2 = 0.9219775762409022, m3 = -8.532086008976918e-05.
+Time for LLG calculation used: 600.97 s.
+Now calculating LLG with Hext1 = -4360 A/m.
+m diff L2 norm sq: 0.0000338510 at LLG step 200
+m diff L2 norm sq: 0.0000058097 at LLG step 400
+m diff L2 norm sq: 0.0000179855 at LLG step 600
+m diff L2 norm sq: 0.0007601655 at LLG step 800
+m diff L2 norm sq: 0.1592362910 at LLG step 1000
+Field written to /fast/pj24001684/pytorch_mpi/CuPyMag/examples/test_output_quick/field_-4360_1.vtu.
+Final state for average magnetization: m1 = -0.6989541644154132, m2 = 0.5903630819322625, m3 = -0.026538230684131074.
+Field written to /fast/pj24001684/pytorch_mpi/CuPyMag/examples/test_output_quick/field_-4360_2.vtu.
+The code uses 670.84 s in total, 11.18 s for system set up, and 659.66 for LLG calculation.
+
+
+
+4 GPUs
+Current average magnetization is m1 = 0.17416198324794954, m2 = 0.9219775762410298, m3 = -8.532086012392075e-05.
+Time for LLG calculation used: 562.19 s.
+Now calculating LLG with Hext1 = -4360 A/m.
+m diff L2 norm sq: 0.0000338510 at LLG step 200
+m diff L2 norm sq: 0.0000058097 at LLG step 400
+m diff L2 norm sq: 0.0000179855 at LLG step 600
+m diff L2 norm sq: 0.0007601655 at LLG step 800
+m diff L2 norm sq: 0.1592362910 at LLG step 1000
+Field written to /fast/pj24001684/pytorch_mpi/CuPyMag/examples/test_output_quick/field_-4360_1.vtu.
+Final state for average magnetization: m1 = -0.6989541643887636, m2 = 0.5903630819671914, m3 = -0.026538230683336817.
+Field written to /fast/pj24001684/pytorch_mpi/CuPyMag/examples/test_output_quick/field_-4360_2.vtu.
+The code uses 629.89 s in total, 11.45 s for system set up, and 618.44 for LLG calculation.
+
+
+
+8 GPUs
+Current average magnetization is m1 = 0.17416198324994686, m2 = 0.9219775762399388, m3 = -8.532085963263437e-05.
+Time for LLG calculation used: 611.67 s.
+Now calculating LLG with Hext1 = -4360 A/m.
+m diff L2 norm sq: 0.0000338510 at LLG step 200
+m diff L2 norm sq: 0.0000058097 at LLG step 400
+m diff L2 norm sq: 0.0000179855 at LLG step 600
+m diff L2 norm sq: 0.0007601655 at LLG step 800
+m diff L2 norm sq: 0.1592362910 at LLG step 1000
+Field written to /fast/pj24001684/pytorch_mpi/CuPyMag/examples/test_output_quick/field_-4360_1.vtu.
+Final state for average magnetization: m1 = -0.6989541644155195, m2 = 0.5903630819322313, m3 = -0.026538230684135446.
+Field written to /fast/pj24001684/pytorch_mpi/CuPyMag/examples/test_output_quick/field_-4360_2.vtu.
+The code uses 684.43 s in total, 12.24 s for system set up, and 672.20 for LLG calculation.

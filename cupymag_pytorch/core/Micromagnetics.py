@@ -144,6 +144,7 @@ def main():
                 maxiter=maxiter,
                 system="elasticity",
                 use_init=use_init,
+            check_every=cg_check_every,
             )
 
             if rot111:
@@ -199,6 +200,7 @@ def main():
             maxiter=maxiter,
             system="demag",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         Htilde1, Htilde2, Htilde3 = Deriv.compute_Hd_from_U(U)
@@ -288,6 +290,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel g1n",
             use_init=use_init,
+            check_every=cg_check_every,
         )
         g2n = solve_cg(
             A1,
@@ -297,6 +300,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel g2n",
             use_init=use_init,
+            check_every=cg_check_every,
         )
         g3n = solve_cg(
             A1,
@@ -306,6 +310,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel g3n",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         m1star = m[:, 0] + g2n * m[:, 2] - g3n * m[:, 1]
@@ -319,6 +324,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel g1star",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         m2star = m[:, 1] + g3n * m1star - g1star * m[:, 2]
@@ -332,6 +338,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel g2star",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         m3star = m[:, 2] + g1star * m2star - g2star * m1star
@@ -413,6 +420,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel m1starstar",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         b_gstar = F1 @ f2temp
@@ -424,6 +432,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel m2starstar",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         b_gstar = F1 @ f3temp
@@ -435,6 +444,7 @@ def main():
             maxiter=maxiter,
             system="Gauss-Seidel m3starstar",
             use_init=use_init,
+            check_every=cg_check_every,
         )
 
         magnitude = torch.sqrt(m1starstar**2 + m2starstar**2 + m3starstar**2)

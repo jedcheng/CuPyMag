@@ -1,0 +1,71 @@
+# GPU scaling benchmark workload: 64x64x32 Hex mesh (131k DOFs).
+# The metric is the per-field "Time for LLG calculation used" line; a full
+# sweep is long — let the elapse limit cut it after a few field steps.
+# solver.check_every: 8 reduces GPU->host syncs in the CG loop (up to 7
+# harmless extra iterations per solve).
+physics:
+  magnetic:
+    ms: 1.25e+6
+    exchange_stiffness: 1.0e-11
+    anisotropy_k1: 958.0
+  elastic:
+    c11: 240.0e+9
+    c12: 89.0e+9
+    c44: 76.0e+9
+  magnetostriction:
+    lambda100: 10.0e-6
+    lambda111: 30.9e-6
+  demagnetization:
+    n_x: 0.0
+    n_y: 0.0
+    n_z: 1.0
+  external_field:
+    hext1: 200.0
+    dhext1: 80.0
+    hext2: 0.01
+    dhext2: 0.0
+    hext3: 0.0
+    dhext3: 0.0
+  external_stress:
+    sigma11: 0.0
+    sigma22: 0.0
+    sigma33: 0.0
+    sigma12: 0.0
+    sigma23: 0.0
+    sigma13: 0.0
+  rotation_111: false
+  magnetoelastic_coupling: false
+  characteristic_length: 10.0e-9
+
+grid:
+  type: "Hex"
+  cubic_mesh:
+    nx: 64
+    ny: 64
+    nz: 32
+    ndx: 4
+    ndy: 4
+    ndz: 4
+
+simulation:
+  precision: "DP"
+  llg:
+    timestep: 3.0e-12
+    alpha_damping: 0.15
+    llg_accuracy_factor: 5.0e-10
+  solver:
+    tolerance: 1.0e-7
+    max_iterations: 5000
+    initial_factor: 100.0
+    check_every: 8
+  restart: false
+  initial_magnetization: [1.0, 0.0, 0.0]
+  stop_condition:
+    direction: [0.8, 0.6, 0.0]
+    value: -0.2
+
+output:
+  directory: "bench_output_64"
+  write_magnetization: true
+  save_frequency: 1000
+  vtu_blend_alpha: 0.05

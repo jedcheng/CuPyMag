@@ -145,6 +145,10 @@ solver = sim["solver"]
 tol = solver["tolerance"]
 maxiter = solver["max_iterations"]
 use_init_factor = solver["initial_factor"]
+# Fetch the CG convergence flag from the device only every N iterations
+# (up to N-1 overshoot iterations past convergence; reduces host syncs,
+# which matters on GPU).
+cg_check_every = int(solver.get("check_every", 1))
 
 restart = sim.get("restart", False)
 restart_m = sim.get("restart_magnetization", None)
