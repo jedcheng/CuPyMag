@@ -192,6 +192,146 @@ def solve_cg(
     raise RuntimeError(msg)
 
 
+class DistBlockMat:
+    """Distributed elasticity stiffness A_el: component-major DOFs
+    [u_x; u_y; u_z], stored as a 3x3 grid of node-partitioned row blocks.
+
+    One halo exchange of the (n_own, 3) displacement field serves all nine
+    block SpMVs. The ``A @ v`` interface takes/returns the *flattened*
+    component-major local vector (3*n_own,), matching the serial layout so
+    ``solve_cg`` treats the coupled system as a single column.
+    """
+
+    def __init__(self, blocks, part: XSlabPartition):
+        self.blocks = blocks  # blocks[da][db] = (A_own, A_ghost)
+        self.part = part
+        self.t = blocks[0][0][0]  # device/dtype reference
+
+    @classmethod
+    def from_scipy_global(cls, A_sp, part: XSlabPartition):
+        n = part.n_dof
+        A_sp = A_sp.tocsr()
+        blocks = [
+            [
+                part.extract_rows(
+                    A_sp[da * n : (da + 1) * n, db * n : (db + 1) * n].tocsr()
+                )
+                for db in range(3)
+            ]
+            for da in range(3)
+        ]
+        return cls(blocks, part)
+
+    def matmul(self, v):
+        squeeze = v.dim() == 1
+        if not squeeze:
+            v = v.squeeze(1)
+        n_own = self.part.n_own
+        U = v.view(3, n_own).T.contiguous()  # (n_own, 3), column = component
+
+        ctx = self.part.ghosts_start(U)
+        y = torch.empty_like(U)
+        for da in range(3):
+            acc = torch.sparse.mm(self.blocks[da][0][0], U[:, 0:1])
+            for db in range(1, 3):
+                acc = acc + torch.sparse.mm(self.blocks[da][db][0], U[:, db : db + 1])
+            y[:, da] = acc.squeeze(1)
+        gh = self.part.ghosts_finish(ctx)
+        if gh is not None:
+            for da in range(3):
+                acc = torch.sparse.mm(self.blocks[da][0][1], gh[:, 0:1])
+                for db in range(1, 3):
+                    acc = acc + torch.sparse.mm(
+                        self.blocks[da][db][1], gh[:, db : db + 1]
+                    )
+                y[:, da] = y[:, da] + acc.squeeze(1)
+
+        out = y.T.reshape(-1)
+        return out if squeeze else out.unsqueeze(1)
+
+    def __matmul__(self, v):
+        return self.matmul(v)
+
+
+class DistFMat:
+    """Distributed magnetostriction coupling F_el: three component row
+    blocks over node-major stride-6 (Voigt) columns. ``matmul`` takes the
+    local spontaneous strain E0 as (n_own, 6) and returns the flattened
+    component-major RHS (3*n_own,), sharing one halo exchange."""
+
+    def __init__(self, blocks, part: XSlabPartition):
+        self.blocks = blocks  # blocks[da] = (F_own, F_ghost)
+        self.part = part
+        self.t = blocks[0][0]
+
+    @classmethod
+    def from_scipy_global(cls, F_sp, part: XSlabPartition):
+        n = part.n_dof
+        F_sp = F_sp.tocsr()
+        blocks = [
+            part.extract_rows(F_sp, row_start=da * n, col_stride=6)
+            for da in range(3)
+        ]
+        return cls(blocks, part)
+
+    def matmul(self, E0):
+        ctx = self.part.ghosts_start(E0)
+        E0f = E0.reshape(-1, 1)  # node-major, matches stride-6 column layout
+        cols = [torch.sparse.mm(self.blocks[da][0], E0f) for da in range(3)]
+        gh = self.part.ghosts_finish(ctx)
+        if gh is not None:
+            ghf = gh.reshape(-1, 1)
+            cols = [
+                cols[da] + torch.sparse.mm(self.blocks[da][1], ghf)
+                for da in range(3)
+            ]
+        return torch.cat(cols, dim=0).squeeze(1)  # (3*n_own,)
+
+    def __matmul__(self, E0):
+        return self.matmul(E0)
+
+
+def compute_E_from_u_dist(Fx, Fy, Fz, part, U3, R=None):
+    """Voigt strains (n_own, 6) from the local displacement components
+    ``U3`` (n_own, 3); mirrors ``ComputeDerivatives.compute_E_from_u``
+    with a single shared halo exchange for all nine derivative SpMVs."""
+    gh = part.get_ghosts(U3)
+
+    def D(mat, c):
+        g = None if gh is None else gh[:, c : c + 1]
+        return mat.matmul_with_ghosts(U3[:, c : c + 1], g).squeeze(1)
+
+    if R is None:
+        E11 = D(Fx, 0)
+        E22 = D(Fy, 1)
+        E33 = D(Fz, 2)
+        E12 = D(Fy, 0) + D(Fx, 1)
+        E23 = D(Fz, 1) + D(Fy, 2)
+        E13 = D(Fz, 0) + D(Fx, 2)
+    else:
+        dxx, dyx, dzx = D(Fx, 0), D(Fy, 0), D(Fz, 0)
+        dxy, dyy, dzy = D(Fx, 1), D(Fy, 1), D(Fz, 1)
+        dxz, dyz, dzz = D(Fx, 2), D(Fy, 2), D(Fz, 2)
+
+        E11 = (R[0, 0] * dxx) + (R[1, 0] * dyx) + (R[2, 0] * dzx)
+        E22 = (R[0, 1] * dxy) + (R[1, 1] * dyy) + (R[2, 1] * dzy)
+        E33 = (R[0, 2] * dxz) + (R[1, 2] * dyz) + (R[2, 2] * dzz)
+        E12 = (
+            (R[0, 1] * dxx) + (R[1, 1] * dyx) + (R[2, 1] * dzx)
+            + (R[0, 0] * dxy) + (R[1, 0] * dyy) + (R[2, 0] * dzy)
+        )
+        E23 = (
+            (R[0, 2] * dxy) + (R[1, 2] * dyy) + (R[2, 2] * dzy)
+            + (R[0, 1] * dxz) + (R[1, 1] * dyz) + (R[2, 1] * dzz)
+        )
+        E13 = (
+            (R[0, 2] * dxx) + (R[1, 2] * dyx) + (R[2, 2] * dzx)
+            + (R[0, 0] * dxz) + (R[1, 0] * dyz) + (R[2, 0] * dzz)
+        )
+
+    return torch.stack([E11, E22, E33, E12, E23, E13], dim=-1)
+
+
 class DistVolumeAverage(VolumeAverage):
     """Volume average over the rank-local element slice with global reduction.
 

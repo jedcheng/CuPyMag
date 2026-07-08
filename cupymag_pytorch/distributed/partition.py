@@ -166,20 +166,32 @@ class XSlabPartition:
             crow, col, vals, B.shape, requires_grad=False
         )
 
-    def extract_row_block(self, A_scipy_csr):
-        """Extract this rank's row block of a global (n_dof x n_dof) scipy
-        CSR matrix, remapping columns into the ghost-extended local index
-        space and splitting by column ownership.
+    def remap_strided(self, stride):
+        """Column remap for operators whose columns are node-major with
+        ``stride`` entries per node (e.g. F_el with 6 Voigt components):
+        global column node*stride + j -> local ext-node index * stride + j."""
+        if stride == 1:
+            return self._remap
+        rep = np.repeat(self._remap, stride)
+        offs = np.tile(np.arange(stride, dtype=np.int64), self.n_dof)
+        return np.where(rep >= 0, rep * stride + offs, -1)
+
+    def extract_rows(self, A_scipy_csr, row_start=0, col_stride=1):
+        """Extract the rows [row_start + r0, row_start + r1) of a global
+        scipy CSR matrix whose columns are node-major with ``col_stride``
+        entries per node, remapping columns into the ghost-extended local
+        index space and splitting by column ownership.
 
         Returns ``(A_own, A_ghost)`` torch sparse CSR tensors of shapes
-        (n_own, n_own) and (n_own, 2*plane); ``A_ghost`` is ``None`` for a
-        single rank. The split lets the ghost exchange overlap with the
-        ``A_own`` SpMV.
+        (n_own, n_own*col_stride) and (n_own, 2*plane*col_stride);
+        ``A_ghost`` is ``None`` for a single rank. The split lets the ghost
+        exchange overlap with the ``A_own`` SpMV.
         """
         from scipy.sparse import csr_matrix
 
-        B = A_scipy_csr[self.r0 : self.r1, :].tocsr()
-        cols = self._remap[B.indices]
+        B = A_scipy_csr[row_start + self.r0 : row_start + self.r1, :].tocsr()
+        remap = self.remap_strided(col_stride)
+        cols = remap[B.indices]
         if cols.size and cols.min() < 0:
             bad = np.unique(B.indices[cols < 0])
             raise RuntimeError(
@@ -187,14 +199,19 @@ class XSlabPartition:
                 f"the +-1-plane halo (e.g. global cols {bad[:10]}); x-slab "
                 "partitioning is not valid for this operator."
             )
-        Bm = csr_matrix(
-            (B.data, cols, B.indptr), shape=(self.n_own, self.n_ext)
-        )
+        n_own_c = self.n_own * col_stride
+        n_ext_c = self.n_ext * col_stride
+        Bm = csr_matrix((B.data, cols, B.indptr), shape=(self.n_own, n_ext_c))
         if self.world_size == 1:
             return self._to_torch_csr(Bm), None
-        A_own = self._to_torch_csr(Bm[:, : self.n_own].tocsr())
-        A_ghost = self._to_torch_csr(Bm[:, self.n_own :].tocsr())
+        A_own = self._to_torch_csr(Bm[:, :n_own_c].tocsr())
+        A_ghost = self._to_torch_csr(Bm[:, n_own_c:].tocsr())
         return A_own, A_ghost
+
+    def extract_row_block(self, A_scipy_csr):
+        """Row block [r0, r1) of a global (n_dof x n_dof) scipy CSR matrix
+        (scalar node columns); see :meth:`extract_rows`."""
+        return self.extract_rows(A_scipy_csr)
 
     # ------------------------------------------------------------------
     # Halo exchange

@@ -160,6 +160,73 @@ err_t = torch.tensor([abs((a_dist - a_ref).item())])
 dist.all_reduce(err_t, op=dist.ReduceOp.MAX)
 check("volume average (scalar)", err_t.item() < 1e-12, f"max|diff|={err_t.item():.2e}")
 
+# ---- 5. elasticity operators -------------------------------------------
+from cupymag_pytorch.distributed.micromagnetics import _assemble_elasticity_scipy
+from cupymag_pytorch.distributed.ops import (
+    DistBlockMat,
+    DistFMat,
+    compute_E_from_u_dist,
+)
+from cupymag_pytorch.utils.compute_derivatives import ComputeDerivatives
+
+A_el_sp, F_el_sp = _assemble_elasticity_scipy(mesh)
+A_el = DistBlockMat.from_scipy_global(A_el_sp, part)
+F_el = DistFMat.from_scipy_global(F_el_sp, part)
+
+
+def slice_cm(v_full, ncomp):
+    """Component-major local slice: [v_c[r0:r1] for each component]."""
+    return torch.cat(
+        [v_full[c * nDOF + part.r0 : c * nDOF + part.r1] for c in range(ncomp)]
+    )
+
+
+# A_el SpMV (relative error: normalized c11 makes entries ~1e5)
+u_full = torch.randn(3 * nDOF, dtype=torch.float64, device=DEVICE)
+y_ref = torch.from_numpy(A_el_sp @ u_full.numpy())
+y_loc = A_el @ slice_cm(u_full, 3).clone()
+scale = y_ref.abs().max().item()
+err_t = torch.tensor([(y_loc - slice_cm(y_ref, 3)).abs().max().item() / scale])
+dist.all_reduce(err_t, op=dist.ReduceOp.MAX)
+check("SpMV A_el (3x3 blocks)", err_t.item() < 1e-13, f"rel|diff|={err_t.item():.2e}")
+
+# F_el SpMV (E0 node-major stride 6)
+E0_full = torch.randn(nDOF, 6, dtype=torch.float64, device=DEVICE)
+yF_ref = torch.from_numpy(F_el_sp @ E0_full.reshape(-1).numpy())
+yF_loc = F_el @ E0_full[part.r0 : part.r1].clone()
+scale = yF_ref.abs().max().item()
+err_t = torch.tensor([(yF_loc - slice_cm(yF_ref, 3)).abs().max().item() / scale])
+dist.all_reduce(err_t, op=dist.ReduceOp.MAX)
+check("SpMV F_el (stride-6 cols)", err_t.item() < 1e-13, f"rel|diff|={err_t.item():.2e}")
+
+# CG on A_el (anchored: rows 0, n, 2n pinned)
+b_el = torch.randn(3 * nDOF, dtype=torch.float64, device=DEVICE)
+b_el[[0, nDOF, 2 * nDOF]] = 0.0
+A_el_serial = SparseMat.from_scipy(A_el_sp)
+x_ref = solve_cg_serial(A_el_serial, b_el, tol=1e-9)
+x_loc = solve_cg_dist(A_el, slice_cm(b_el, 3).clone(), tol=1e-9)
+err_t = torch.tensor([(x_loc - slice_cm(x_ref, 3)).abs().max().item()])
+dist.all_reduce(err_t, op=dist.ReduceOp.MAX)
+check("CG A_el vs serial", err_t.item() < 1e-7, f"max|diff|={err_t.item():.2e}")
+
+# compute_E_from_u vs serial (plain and rotated)
+Fx_s = SparseMat.from_scipy(Fx_sp)
+Fy_s = SparseMat.from_scipy(Fy_sp)
+Fz_s = SparseMat.from_scipy(Fz_sp)
+Deriv = ComputeDerivatives(Fx_s, Fy_s, Fz_s)
+Fy_d = DistSparseMat.from_scipy_global(Fy_sp, part)
+Fz_d = DistSparseMat.from_scipy_global(Fz_sp, part)
+Fx_d = DistSparseMat.from_scipy_global(Fx_sp, part)
+U3_loc = torch.stack(
+    [u_full[c * nDOF + part.r0 : c * nDOF + part.r1] for c in range(3)], dim=1
+).contiguous()
+for Rm, name in [(None, "plain"), (torch.linalg.qr(torch.randn(3, 3, dtype=torch.float64))[0], "rotated")]:
+    E_ref = Deriv.compute_E_from_u(nDOF, u_full, Rm)
+    E_loc = compute_E_from_u_dist(Fx_d, Fy_d, Fz_d, part, U3_loc, Rm)
+    err_t = torch.tensor([(E_loc - E_ref[part.r0 : part.r1]).abs().max().item()])
+    dist.all_reduce(err_t, op=dist.ReduceOp.MAX)
+    check(f"compute_E_from_u ({name})", err_t.item() < 1e-12, f"max|diff|={err_t.item():.2e}")
+
 # ---- summary -----------------------------------------------------------
 nfail = torch.tensor([len(failures)])
 dist.all_reduce(nfail, op=dist.ReduceOp.SUM)

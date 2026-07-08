@@ -1,5 +1,5 @@
 # Copyright (c) 2025-2026 Hongyi Guan
-# PyTorch port of CuPyMag — distributed backend (Phase 1)
+# PyTorch port of CuPyMag — distributed backend (Phase 1/2/3)
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,15 +15,19 @@
 
 """Distributed LLG main loop (Gauss-Seidel projection method).
 
-Mirrors ``cupymag_pytorch.core.Micromagnetics.main`` step for step. The
-FEM system is assembled replicated on the CPU (scipy CSR); each rank then
-keeps only its x-slab row block (``XSlabPartition``). All per-DOF algebra
-is rank-local; CG dot products, the LLG convergence norm and volume
-averages are globally reduced, so every rank sees identical scalars and
-takes identical control-flow branches. Output (VTU / HDF5 / hysteresis)
-is written by rank 0 from gathered fields.
+Mirrors ``cupymag_pytorch.core.Micromagnetics.main`` step for step,
+including magnetoelastic coupling. The FEM system is assembled replicated
+on the CPU (scipy CSR); each rank then keeps only its x-slab row blocks
+(``XSlabPartition``). All per-DOF algebra is rank-local; CG dot products,
+the LLG convergence norm and volume averages are globally reduced, so
+every rank sees identical scalars and takes identical control-flow
+branches. Output (VTU / HDF5 / hysteresis) is written by rank 0 from
+gathered fields.
 
-Phase 1 scope: Hex mesh, magnetoelastic coupling (ME) not supported.
+Phase 2 batching: the g1n/g2n/g3n and m*starstar triples run as 3-RHS
+batched CG on their shared matrices; the F SpMV groups share one halo
+exchange each. Phase 3: the elasticity system is distributed as a 3x3
+grid of component row blocks (``DistBlockMat`` / ``DistFMat``).
 """
 
 import os
@@ -41,18 +45,24 @@ from cupymag_pytorch.utils.precision_select import get_float_type
 float_cp = get_float_type(precision, backend="torch")
 
 from cupymag_pytorch.distributed.ops import (
+    DistBlockMat,
+    DistFMat,
     DistSparseMat,
     DistVolumeAverage,
+    compute_E_from_u_dist,
     solve_cg,
 )
 from cupymag_pytorch.distributed.partition import XSlabPartition
 from cupymag_pytorch.mesh.setup_FEM_mesh import FEMMesh
 from cupymag_pytorch.physics.assemble_demag import AssembleDemag
+from cupymag_pytorch.physics.assemble_elasticity import AssembleElasticity
 from cupymag_pytorch.physics.assemble_Gauss_Seidel import AssembleGaussSeidel
+from cupymag_pytorch.utils.final_assembly import build_E0_from_m
 from cupymag_pytorch.utils.magnetization_io import initialize_m, write_array
 from cupymag_pytorch.utils.print_logo import print_logo
 from cupymag_pytorch.utils.print_system_info import print_system_info_summary
 from cupymag_pytorch.utils.rot_111_matrices import get_M_matrix, get_R_matrix
+from cupymag_pytorch.utils.sigma_matrices import get_Ebar_sigma
 from cupymag_pytorch.utils.sparse_wrapper import (
     enforce_defect_region_A_scipy,
     enforce_defect_region_F_scipy,
@@ -60,13 +70,13 @@ from cupymag_pytorch.utils.sparse_wrapper import (
 from cupymag_pytorch.utils.volume_average import VolumeAverage
 
 
-def _csr(rows, cols, vals, n):
+def _csr(rows, cols, vals, nx, ny=None):
     return coo_matrix(
         (
             np.asarray(vals, dtype=np.float64),
             (np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64)),
         ),
-        shape=(n, n),
+        shape=(nx, ny if ny is not None else nx),
     ).tocsr()
 
 
@@ -99,6 +109,27 @@ def _assemble_global_scipy(mesh, defect_dofs):
     return A_demag, Fx, Fy, Fz, A1, A2, F1
 
 
+def _assemble_elasticity_scipy(mesh):
+    """Replicated assembly of the elasticity operators (anchors applied
+    inside the assembler, mirroring SimulationOperators.csr_elasticity)."""
+    n = mesh.n_dof
+    ea = AssembleElasticity(
+        mesh.node_coords_np,
+        mesh.elements_np,
+        mesh.global_id_np,
+        c11,
+        c12,
+        c44,
+        lambda100,
+        lambda111,
+    )
+    r, c, v = ea.build_coo_matrix_A_numba()
+    A_el = _csr(r, c, v, 3 * n)
+    fr, fc, fv = ea.build_coo_matrices_F_numba()
+    F_el = _csr(fr, fc, fv, 3 * n, 6 * n)
+    return A_el, F_el
+
+
 def main():
     if not dist.is_initialized():
         raise RuntimeError(
@@ -109,11 +140,12 @@ def main():
     world_size = dist.get_world_size()
     root = rank == 0
 
+    # Elastic coupling constants enter the LLG algebra only when ME is on
+    # (mirrors the serial main, which zeroes the module globals).
     if ME:
-        raise NotImplementedError(
-            "Magnetoelastic coupling is not supported by the distributed "
-            "backend yet (Phase 3); set magnetoelastic_coupling: false."
-        )
+        eC1, eC2, eC3 = elasC1, elasC2, elasC3
+    else:
+        eC1 = eC2 = eC3 = 0.0
 
     if root:
         print_logo()
@@ -134,6 +166,11 @@ def main():
     # Rotation matrix [100] -> [111]: y = R x, x in [100], y in [111]
     if rot111:
         R = get_R_matrix(backend="torch", dtype=float_cp)
+        M = get_M_matrix(backend="torch", dtype=float_cp)
+        M_inv_T = torch.linalg.inv(M).T
+
+    # Strains from the external stress
+    E_bar_sigma = get_Ebar_sigma()
 
     # Replicated mesh + assembly, then per-rank row blocks.
     mesh = FEMMesh()
@@ -166,6 +203,12 @@ def main():
     F1 = DistSparseMat.from_scipy_global(F1_sp, part)
     del A_demag_sp, Fx_sp, Fy_sp, Fz_sp, A1_sp, A2_sp, F1_sp
 
+    if ME:
+        A_el_sp, F_el_sp = _assemble_elasticity_scipy(mesh)
+        A_el = DistBlockMat.from_scipy_global(A_el_sp, part)
+        F_el = DistFMat.from_scipy_global(F_el_sp, part)
+        del A_el_sp, F_el_sp
+
     Avg = DistVolumeAverage(
         mesh.node_coords_pt, mesh.elements_pt, mesh.global_id_pt, part
     )
@@ -194,12 +237,17 @@ def main():
     nstep = 0
     count = 0
 
-    llg_min_step = 100
+    if ME == True:
+        llg_min_step = 10
+    else:
+        llg_min_step = 100
+
     LLG_accuracy = nDOF * LLG_accuracy_factor
 
     m_prev = m.clone()
 
     U = None
+    u = None
     Gn = None  # batched g1n/g2n/g3n warm start (n_own, 3)
     g1star = None
     g2star = None
@@ -251,8 +299,66 @@ def main():
         if rot111 == True:
             m100 = m @ R
 
-        # ME is not supported: strains are zero on the local rows.
-        E = torch.zeros((part.n_own, 6), dtype=float_cp, device=DEVICE)
+        if ME == True:
+            if rot111 == True:
+                E0 = build_E0_from_m(lambda100, lambda111, m100)
+                E0 = E0.reshape((part.n_own, 6))
+                E0 = E0 @ M.T
+            else:
+                E0 = build_E0_from_m(lambda100, lambda111, m).reshape(
+                    (part.n_own, 6)
+                )
+
+            b_el = F_el @ E0
+            u = solve_cg(
+                A_el,
+                b_el,
+                x0=u,
+                tol=tol,
+                maxiter=maxiter,
+                system="elasticity",
+                use_init=use_init,
+            )
+
+            U3 = u.view(3, part.n_own).T.contiguous()
+            E = compute_E_from_u_dist(Fx, Fy, Fz, part, U3, R if rot111 else None)
+
+            # Remove the volume integral of E (result in E_tilde)
+            E = E - Avg.compute_average_field_gpu(E)
+
+            # Compute E_bar
+            if rot111 == False:
+                E_bar11 = 1.5 * lambda100 * (avg_m[0] ** 2 - 1 / 3) + E_bar_sigma[0]
+                E_bar22 = 1.5 * lambda100 * (avg_m[1] ** 2 - 1 / 3) + E_bar_sigma[1]
+                E_bar33 = 1.5 * lambda100 * (avg_m[2] ** 2 - 1 / 3) + E_bar_sigma[2]
+                E_bar12 = 3.0 * lambda111 * avg_m[0] * avg_m[1] + E_bar_sigma[3]
+                E_bar23 = 3.0 * lambda111 * avg_m[1] * avg_m[2] + E_bar_sigma[4]
+                E_bar13 = 3.0 * lambda111 * avg_m[0] * avg_m[2] + E_bar_sigma[5]
+            else:
+                avg_m100 = Avg.compute_average_field_gpu(m100)
+                E_bar11 = 1.5 * lambda100 * (avg_m100[0] ** 2 - 1 / 3) + E_bar_sigma[0]
+                E_bar22 = 1.5 * lambda100 * (avg_m100[1] ** 2 - 1 / 3) + E_bar_sigma[1]
+                E_bar33 = 1.5 * lambda100 * (avg_m100[2] ** 2 - 1 / 3) + E_bar_sigma[2]
+                E_bar12 = 3.0 * lambda111 * avg_m100[0] * avg_m100[1] + E_bar_sigma[3]
+                E_bar23 = 3.0 * lambda111 * avg_m100[1] * avg_m100[2] + E_bar_sigma[4]
+                E_bar13 = 3.0 * lambda111 * avg_m100[0] * avg_m100[2] + E_bar_sigma[5]
+                E_bar = torch.stack(
+                    [E_bar11, E_bar22, E_bar33, E_bar12, E_bar23, E_bar13]
+                )
+                E_bar11, E_bar22, E_bar33, E_bar12, E_bar23, E_bar13 = M @ E_bar
+
+            # Compute the "true" total strain
+            E[:, 0] = E[:, 0] + E_bar11
+            E[:, 1] = E[:, 1] + E_bar22
+            E[:, 2] = E[:, 2] + E_bar33
+            E[:, 3] = E[:, 3] + E_bar12
+            E[:, 4] = E[:, 4] + E_bar23
+            E[:, 5] = E[:, 5] + E_bar13
+
+            if rot111 == True:
+                E = E @ M_inv_T
+        else:
+            E = torch.zeros((part.n_own, 6), dtype=float_cp, device=DEVICE)
 
         # One shared halo exchange for the three F SpMVs on m_tilde.
         gh = part.get_ghosts(m_tilde)
@@ -296,18 +402,27 @@ def main():
                 + 0.5 * Hbar1
                 + 0.5 * Htilde1
                 + Hext1
+                - 2.0 * eC1 * m[:, 0] * (m2_sq + m3_sq)
+                - 2.0 * eC2 * (E[:, 0] - lambda100) * m[:, 0]
+                - eC3 * (E[:, 3] * m[:, 1] + E[:, 5] * m[:, 2])
             )
             f2 = (
                 -2.0 * K1 * m[:, 1] * (m3_sq + m1_sq)
                 + 0.5 * Hbar2
                 + 0.5 * Htilde2
                 + Hext2
+                - 2.0 * eC1 * m[:, 1] * (m3_sq + m1_sq)
+                - 2.0 * eC2 * (E[:, 1] - lambda100) * m[:, 1]
+                - eC3 * (E[:, 4] * m[:, 2] + E[:, 3] * m[:, 0])
             )
             f3 = (
                 -2.0 * K1 * m[:, 2] * (m1_sq + m2_sq)
                 + 0.5 * Hbar3
                 + 0.5 * Htilde3
                 + Hext3
+                - 2.0 * eC1 * m[:, 2] * (m1_sq + m2_sq)
+                - 2.0 * eC2 * (E[:, 2] - lambda100) * m[:, 2]
+                - eC3 * (E[:, 5] * m[:, 0] + E[:, 4] * m[:, 1])
             )
         else:
             m_squared = m100 * m100
@@ -317,9 +432,24 @@ def main():
 
             # First order derivatives of free energy in [100] coordinate
             v = torch.zeros((part.n_own, 3), dtype=float_cp, device=DEVICE)
-            v[:, 0] = -2.0 * K1 * m100[:, 0] * (m2_sq + m3_sq)
-            v[:, 1] = -2.0 * K1 * m100[:, 1] * (m3_sq + m1_sq)
-            v[:, 2] = -2.0 * K1 * m100[:, 2] * (m1_sq + m2_sq)
+            v[:, 0] = (
+                -2.0 * K1 * m100[:, 0] * (m2_sq + m3_sq)
+                - 2.0 * eC1 * m100[:, 0] * (m2_sq + m3_sq)
+                - 2.0 * eC2 * (E[:, 0] - lambda100) * m100[:, 0]
+                - eC3 * (E[:, 3] * m100[:, 1] + E[:, 5] * m100[:, 2])
+            )
+            v[:, 1] = (
+                -2.0 * K1 * m100[:, 1] * (m3_sq + m1_sq)
+                - 2.0 * eC1 * m100[:, 1] * (m3_sq + m1_sq)
+                - 2.0 * eC2 * (E[:, 1] - lambda100) * m100[:, 1]
+                - eC3 * (E[:, 4] * m100[:, 2] + E[:, 3] * m100[:, 0])
+            )
+            v[:, 2] = (
+                -2.0 * K1 * m100[:, 2] * (m1_sq + m2_sq)
+                - 2.0 * eC1 * m100[:, 2] * (m1_sq + m2_sq)
+                - 2.0 * eC2 * (E[:, 2] - lambda100) * m100[:, 2]
+                - eC3 * (E[:, 5] * m100[:, 0] + E[:, 4] * m100[:, 1])
+            )
             v = v @ R.T
 
             f1 = v[:, 0] + 0.5 * Hbar1 + 0.5 * Htilde1 + Hext1
@@ -329,7 +459,9 @@ def main():
         # Batched 3-RHS solve: g1n/g2n/g3n share A1 (one exchange for the
         # RHS SpMV, and each CG iteration's collectives amortize over the
         # three columns).
-        Ftemp = torch.stack([f1 * dt + m[:, 0], f2 * dt + m[:, 1], f3 * dt + m[:, 2]], dim=1)
+        Ftemp = torch.stack(
+            [f1 * dt + m[:, 0], f2 * dt + m[:, 1], f3 * dt + m[:, 2]], dim=1
+        )
         B_gn = F1 @ Ftemp
 
         Gn = solve_cg(
@@ -383,18 +515,27 @@ def main():
                 + 0.5 * Hbar1
                 + 0.5 * Htilde1
                 + Hext1
+                - 2.0 * eC1 * m1star * (m2_sq + m3_sq)
+                - 2.0 * eC2 * (E[:, 0] - lambda100) * m1star
+                - eC3 * (E[:, 3] * m2star + E[:, 5] * m3star)
             ) * dt2 + m1star
             f2temp = (
                 -2.0 * K1 * m2star * (m3_sq + m1_sq)
                 + 0.5 * Hbar2
                 + 0.5 * Htilde2
                 + Hext2
+                - 2.0 * eC1 * m2star * (m3_sq + m1_sq)
+                - 2.0 * eC2 * (E[:, 1] - lambda100) * m2star
+                - eC3 * (E[:, 4] * m3star + E[:, 3] * m1star)
             ) * dt2 + m2star
             f3temp = (
                 -2.0 * K1 * m3star * (m1_sq + m2_sq)
                 + 0.5 * Hbar3
                 + 0.5 * Htilde3
                 + Hext3
+                - 2.0 * eC1 * m3star * (m1_sq + m2_sq)
+                - 2.0 * eC2 * (E[:, 2] - lambda100) * m3star
+                - eC3 * (E[:, 5] * m1star + E[:, 4] * m2star)
             ) * dt2 + m3star
         else:
             m100 = torch.stack([m1star, m2star, m3star], dim=-1) @ R
@@ -404,10 +545,26 @@ def main():
             m2_sq = m_squared[:, 1]
             m3_sq = m_squared[:, 2]
 
+            # First order derivatives of free energy in [100] coordinate
             v = torch.zeros((part.n_own, 3), dtype=float_cp, device=DEVICE)
-            v[:, 0] = -2.0 * K1 * m100[:, 0] * (m2_sq + m3_sq)
-            v[:, 1] = -2.0 * K1 * m100[:, 1] * (m3_sq + m1_sq)
-            v[:, 2] = -2.0 * K1 * m100[:, 2] * (m1_sq + m2_sq)
+            v[:, 0] = (
+                -2.0 * K1 * m100[:, 0] * (m2_sq + m3_sq)
+                - 2.0 * eC1 * m100[:, 0] * (m2_sq + m3_sq)
+                - 2.0 * eC2 * (E[:, 0] - lambda100) * m100[:, 0]
+                - eC3 * (E[:, 3] * m100[:, 1] + E[:, 5] * m100[:, 2])
+            )
+            v[:, 1] = (
+                -2.0 * K1 * m100[:, 1] * (m3_sq + m1_sq)
+                - 2.0 * eC1 * m100[:, 1] * (m3_sq + m1_sq)
+                - 2.0 * eC2 * (E[:, 1] - lambda100) * m100[:, 1]
+                - eC3 * (E[:, 4] * m100[:, 2] + E[:, 3] * m100[:, 0])
+            )
+            v[:, 2] = (
+                -2.0 * K1 * m100[:, 2] * (m1_sq + m2_sq)
+                - 2.0 * eC1 * m100[:, 2] * (m1_sq + m2_sq)
+                - 2.0 * eC2 * (E[:, 2] - lambda100) * m100[:, 2]
+                - eC3 * (E[:, 5] * m100[:, 0] + E[:, 4] * m100[:, 1])
+            )
             v = v @ R.T
 
             f1temp = (v[:, 0] + 0.5 * Hbar1 + 0.5 * Htilde1 + Hext1) * dt2 + m1star
@@ -498,7 +655,6 @@ def main():
             f"m2 = {avg_m[1].item()}, m3 = {avg_m[2].item()}."
         )
     count += 1
-    E = torch.zeros((part.n_own, 6), dtype=float_cp, device=DEVICE)
     write_outputs(Htilde1, Htilde2, Htilde3, E, count)
     if root:
         current_time = time.time()

@@ -169,7 +169,8 @@ the largest) by ~1/P, unlocking problem sizes a single GPU cannot hold.
 | **0** | Serial prep: de-sync the CG loop (device-side scalars, periodic single-boolean convergence checks), add multi-RHS (batched) support to `solve_cg`. Improves single-GPU performance; prerequisite for distribution. | **done** |
 | **1** | Hex mesh, correctness: replicated CPU assembly → per-rank row-block extraction + halo maps → distributed SpMV/CG/reductions → rank-0 I/O. Validate against serial with tolerance-vs-world-size methodology (cf. `sp4_with_comparison.py`). | **done** |
 | **2** | Performance: fused/single-reduction CG, comm–compute overlap, use multi-RHS CG for the 3-RHS groups in `Micromagnetics.py`, benchmark with the synthetic-scaling protocol from the paper. | **done** (GPU/multi-node benchmark pending) |
-| **3** | Generality: Tet/METIS path, distributed elasticity, block-Jacobi preconditioning, parallel VTU output. | planned |
+| **3a** | Distributed magnetoelasticity (ME). | **done** |
+| **3b** | Tet/METIS path, block-Jacobi preconditioning, parallel VTU output, GPU/multi-node scaling study. | planned |
 
 ### Phase 1 details (implemented)
 
@@ -262,6 +263,50 @@ Communication-count reductions in the distributed backend:
   Per LLG step: 5 CG solve calls instead of 9, and roughly 4× fewer
   collectives per solve-iteration in the batched groups.
 
+#### Why the batched solve groups work (explainer)
+
+Both Phase 2 batching tricks exploit the same fact: **collective latency is
+paid per message, not per byte**. One LLG step solves
+
+```
+1. U          ← CG on A_demag
+2. g1n        ← CG on A1  ┐
+3. g2n        ← CG on A1  ├─ independent, same matrix, different RHS
+4. g3n        ← CG on A1  ┘
+5. g1star     ← CG on A1     (needs g1n,g2n,g3n via m1star)
+6. g2star     ← CG on A1     (needs g1star via m2star)
+7. m1starstar ← CG on A2  ┐
+8. m2starstar ← CG on A2  ├─ independent, same matrix, different RHS
+9. m3starstar ← CG on A2  ┘
+```
+
+Solves 2–4 (and 7–9) are the x/y/z components of the same projection
+substep: same matrix, three right-hand sides, no dependency between them.
+Only `g1star`/`g2star` form a genuine sequential chain and stay single.
+
+*Trick 1 — batched CG.* `solve_cg(A1, B)` with `B` of shape (n, 3) runs
+three mathematically independent per-column CGs (batched, not block CG —
+iterates identical to separate solves; α, β, γ, δ are per-column). Per
+iteration: the SpMV reads the matrix once for all three columns (SpMV is
+memory-bound, matrix traffic dominates → extra columns nearly free), the
+halo exchange moves one (plane, 3) block instead of three messages, and the
+fused γ/δ reduction carries a (2, 3) tensor — one collective serving three
+solves. Warm starts stack as the (n, 3) solution of the previous step.
+Trade-off: the batched call returns when *all* columns converge, so early
+finishers keep iterating until the slowest is done — extra compute traded
+for fewer messages (wins when latency dominates, loses when compute does —
+part of the 1-rank overhead).
+
+*Trick 2 — shared exchanges.* `Fx @ U`, `Fy @ U`, `Fz @ U` apply different
+matrices to the *same vector*, and the ghost planes fetched by the halo
+exchange belong to the vector, not the matrix. So the exchange runs once
+(`part.get_ghosts`) and each matrix consumes the same ghost block via
+`matmul_with_ghosts` — six exchanges become two for the `m_tilde` and `U`
+SpMV groups, and `F1 @ [f1, f2, f3]` is one exchange as a 3-column SpMV.
+
+Net per LLG step: 9 → 5 CG calls; 6 → 1 all-reduces per iteration of a
+solve triple; 9 → 3 exchanges for the RHS/derivative SpMVs.
+
 **Phase 2 validation and timings** (same quick-config protocol; note the
 login node is shared, ±10% noise):
 
@@ -340,6 +385,46 @@ Remaining work to fully drop numba:
    numba but dominate setup at scale: `gridHex.std_fem_mesh`'s connectivity
    triple loop and `build_periodic_node_map` (2.8 s at 96³) — both trivially
    vectorizable with numpy meshgrid/`np.unique`.
+
+### Phase 3a details (implemented): distributed magnetoelasticity
+
+The elasticity system's layouts make x-slab distribution reuse the scalar
+machinery directly:
+
+- `A_el` (3n × 3n) is **component-major** (`row = c·n + node`): a 3×3 grid
+  of n×n blocks, each with the scalar hex sparsity. `ops.DistBlockMat`
+  extracts the nine row blocks with the existing remap/split and performs
+  the block SpMV with **one** halo exchange of the (n_own, 3) displacement
+  field; the `A @ v` interface keeps the serial flattened component-major
+  vector so the coupled system runs through `solve_cg` as a single column.
+- `F_el` (3n × 6n) columns are **node-major with stride 6** (Voigt
+  components per node), so node slabs are still contiguous column ranges;
+  `XSlabPartition.remap_strided(6)` generalizes the column remap and
+  `ops.DistFMat` maps the local (n_own, 6) spontaneous strain `E0` to the
+  RHS with one exchange. The three anchor DOFs (rigid-body modes) are
+  applied inside the replicated assembler and come along for free.
+- `ops.compute_E_from_u_dist` mirrors `ComputeDerivatives.compute_E_from_u`
+  (plain and rot111) with one shared exchange for all nine derivative
+  SpMVs; strain de-meaning reuses `DistVolumeAverage` on the (n_own, 6)
+  field. The E_bar algebra is replicated scalars, hence rank-local.
+- The distributed main loop now carries the full serial ME branch
+  (`E0 → b_el → u → E → E_tilde + E_bar`), the elastic terms in the LLG
+  effective field, and `llg_min_step = 10`; rot111+ME is supported.
+
+**Validation** (quick config with `magnetoelastic_coupling: true`, Intel
+MPI, CPU): unit tests at 2/4 ranks — `A_el`/`F_el` SpMV ≤ 8e-16 relative,
+CG on `A_el` vs serial ≤ 3e-16, `compute_E_from_u` (plain and rotated)
+≤ 5e-16. Full hysteresis sweep vs serial ME reference: 59/59 field steps,
+converged avg_m ≤ 1.2e-4 at every field (no metastable flips — the
+cleanest multi-rank sweep so far), final switched state ≤ 3.1e-4.
+Wall time at this tiny size remains slower than serial (735 s vs 289 s at
+2 ranks; the 6144-unknown elasticity solve is latency-bound like the
+rest — GPU/multi-node is where the design targets).
+
+A PJM job-script template for the Genkai GPU-node NCCL scaling benchmark
+is at `doc/prototypes/genkai_gpu_job.sh` (verify rscgrp/gpu directives
+before submitting; the GPU path needs no source-built torch — stock CUDA
+wheels ship NCCL).
 
 ### Phase 0 details (implemented)
 
