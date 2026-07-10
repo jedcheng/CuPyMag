@@ -350,19 +350,19 @@ class DistVolumeAverage(VolumeAverage):
     [owned | right ghost plane] local space.
     """
 
-    def __init__(self, coords, elements, global_id, part: XSlabPartition):
+    def __init__(self, coords, elements, global_id, part):
         self.part = part
-        elements_local = elements[part.e0 : part.e1]
+        elements_local = part.select_elements(elements)
         super().__init__(coords, elements_local, global_id)
 
-        remap_r = torch.as_tensor(
-            part._remap_right, dtype=torch.int64, device=self.corner_dofs.device
+        remap = torch.as_tensor(
+            part.element_remap, dtype=torch.int64, device=self.corner_dofs.device
         )
-        corner_local = remap_r[self.corner_dofs.to(torch.int64)]
+        corner_local = remap[self.corner_dofs.to(torch.int64)]
         if corner_local.numel() and int(corner_local.min()) < 0:
             raise RuntimeError(
                 f"Rank {part.rank}: local elements reference DOFs outside "
-                "[owned + right ghost plane]."
+                "the ghost-extended local index space."
             )
         self.corner_local = corner_local
 
@@ -371,7 +371,7 @@ class DistVolumeAverage(VolumeAverage):
         if is_scalar:
             m = m.reshape(-1, 1)
 
-        m_ext = self.part.extend_right(m)
+        m_ext = self.part.extend_elements(m)
         corner_U = m_ext[self.corner_local]
 
         MGP = torch.einsum("ebk,gb->egk", corner_U, self.N_gauss_gpu)
@@ -437,7 +437,7 @@ class DistVolumeAverage(VolumeAverage):
         gid = to_np(self.original_global_id).astype(np.int64)[piece_nodes]
 
         # DOF value lookup: piece node -> ghost-extended local index.
-        node_ext = np.asarray(part._remap_right)[gid]
+        node_ext = np.asarray(part.element_remap)[gid]
 
         n_nodes, n_elems = coords.shape[0], cells.shape[0]
         N_g = to_np(self.N_gauss_gpu)
@@ -460,7 +460,7 @@ class DistVolumeAverage(VolumeAverage):
         names = []
         for name, f in field_dict.items():
             f2 = f if f.dim() == 2 else f.reshape(-1, 1)
-            f_ext = to_np(part.extend_right(f2)).astype(np.float64)
+            f_ext = to_np(part.extend_elements(f2)).astype(np.float64)
             nC = f_ext.shape[1]
 
             node_val = f_ext[node_ext]  # (n_nodes, nC)

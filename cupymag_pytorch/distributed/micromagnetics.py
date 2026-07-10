@@ -52,7 +52,7 @@ from cupymag_pytorch.distributed.ops import (
     compute_E_from_u_dist,
     solve_cg,
 )
-from cupymag_pytorch.distributed.partition import XSlabPartition
+from cupymag_pytorch.distributed.partition import GeneralPartition, XSlabPartition
 from cupymag_pytorch.mesh.setup_FEM_mesh import FEMMesh
 from cupymag_pytorch.physics.assemble_demag import AssembleDemag
 from cupymag_pytorch.physics.assemble_elasticity import AssembleElasticity
@@ -187,12 +187,15 @@ def main():
         mesh, DefDOF
     )
 
-    part = XSlabPartition(Nx, Ny, Nz, mesh.global_id_np, DEVICE)
-    if root:
-        print(
-            f"[distributed] x-slab partition: {part.Nx} planes over "
-            f"{world_size} ranks, plane size {part.plane} DOFs."
-        )
+    if grid_type == "Hex":
+        part = XSlabPartition(Nx, Ny, Nz, mesh.global_id_np, DEVICE)
+        if root:
+            print(
+                f"[distributed] x-slab partition: {part.Nx} planes over "
+                f"{world_size} ranks, plane size {part.plane} DOFs."
+            )
+    else:
+        part = GeneralPartition(mesh, DEVICE)
 
     A_demag = DistSparseMat.from_scipy_global(A_demag_sp, part)
     Fx = DistSparseMat.from_scipy_global(Fx_sp, part)
@@ -205,7 +208,7 @@ def main():
     # Optional Jacobi (inverse-diagonal) preconditioners, local rows.
     def _inv_diag_local(sp_mat):
         return torch.as_tensor(
-            1.0 / sp_mat.diagonal()[part.r0 : part.r1], dtype=float_cp, device=DEVICE
+            1.0 / part.slice_rows_np(sp_mat.diagonal()), dtype=float_cp, device=DEVICE
         )
 
     if cg_preconditioner == "jacobi":
@@ -225,7 +228,7 @@ def main():
             Mj_el = torch.as_tensor(
                 1.0
                 / np.concatenate(
-                    [d3[c * nDOF + part.r0 : c * nDOF + part.r1] for c in range(3)]
+                    [part.slice_rows_np(d3[c * nDOF : (c + 1) * nDOF]) for c in range(3)]
                 ),
                 dtype=float_cp,
                 device=DEVICE,
@@ -247,7 +250,7 @@ def main():
     m_full = initialize_m(
         restart_m, restart, initial_magnetization, nDOF, DefDOF, float_cp
     )
-    m = m_full[part.r0 : part.r1].clone()
+    m = part.slice_field(m_full)
     del m_full
     DefDOF_local = part.local_defect_dofs(DefDOF)
 
@@ -406,8 +409,8 @@ def main():
             + Fz.matmul_with_ghosts(m_tilde[:, 2:3], None if gh is None else gh[:, 2:3])
         ).squeeze(1)
         # Pin a DOF to 0 here instead of assembly process
-        if part.owns_dof0:
-            b_demag[0] = 0.0
+        if rank == part.anchor_owner:
+            b_demag[part.anchor_local] = 0.0
         U = solve_cg(
             A_demag,
             b_demag,
