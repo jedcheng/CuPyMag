@@ -160,6 +160,31 @@ err_t = torch.tensor([abs((a_dist - a_ref).item())])
 dist.all_reduce(err_t, op=dist.ReduceOp.MAX)
 check("volume average (scalar)", err_t.item() < 1e-12, f"max|diff|={err_t.item():.2e}")
 
+# ---- 4b. Jacobi-preconditioned CG ---------------------------------------
+Mj_A1 = torch.as_tensor(
+    1.0 / A1_sp.diagonal()[part.r0 : part.r1], dtype=torch.float64, device=DEVICE
+)
+x_pcg = solve_cg_dist(A1_dist, b_full[part.r0 : part.r1].clone(), M=Mj_A1, tol=1e-10)
+err_t = torch.tensor([(x_pcg - x_dist).abs().max().item()])
+dist.all_reduce(err_t, op=dist.ReduceOp.MAX)
+check("dist PCG (jacobi) A1", err_t.item() < 1e-8, f"max|diff|={err_t.item():.2e}")
+
+Mj_dm = torch.as_tensor(
+    1.0 / A_demag_sp.diagonal()[part.r0 : part.r1], dtype=torch.float64, device=DEVICE
+)
+x2_pcg = solve_cg_dist(A_demag_dist, b2[part.r0 : part.r1].clone(), M=Mj_dm, tol=1e-9)
+err_t = torch.tensor([(x2_pcg - x2_dist).abs().max().item()])
+dist.all_reduce(err_t, op=dist.ReduceOp.MAX)
+check("dist PCG (jacobi) A_demag", err_t.item() < 1e-6, f"max|diff|={err_t.item():.2e}")
+
+# serial PCG via SparseMat.diagonal()
+x_pcg_s = solve_cg_serial(A1_serial, b_full, M=1.0 / A1_serial.diagonal(), tol=1e-10)
+check(
+    "serial PCG (jacobi) A1",
+    torch.allclose(x_pcg_s, x_serial, atol=1e-8),
+    f"max|diff|={(x_pcg_s - x_serial).abs().max():.2e}",
+)
+
 # ---- 5. elasticity operators -------------------------------------------
 from cupymag_pytorch.distributed.micromagnetics import _assemble_elasticity_scipy
 from cupymag_pytorch.distributed.ops import (

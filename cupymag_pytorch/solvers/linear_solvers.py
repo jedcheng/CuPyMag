@@ -66,9 +66,11 @@ def solve_cg(
     b : torch.Tensor
         Right-hand side, 1-D ``(n,)`` or 2-D ``(n, k)`` for k simultaneous
         solves against the same operator.
-    M : ignored
-        Accepted for API compatibility with the original signature.
-        (No preconditioner is applied.)
+    M : torch.Tensor, optional
+        Jacobi preconditioner as the *inverse diagonal* of ``A``, shape
+        ``(n,)`` (broadcast over RHS columns). ``None`` disables
+        preconditioning. Convergence is still measured on the true
+        relative residual ||b - A x|| / ||b||.
     x0 : torch.Tensor, optional
         Initial guess (same shape as ``b``); only used when ``use_init``
         is True.
@@ -111,8 +113,12 @@ def solve_cg(
         x = torch.zeros_like(b)
         r = b.clone()
 
-    p = r.clone()
-    rs_old = _dots(r, r)  # (k,)
+    if M is not None and M.dim() == 1:
+        M = M.unsqueeze(1)  # inverse diagonal, broadcast over RHS columns
+
+    z = r if M is None else M * r
+    p = z.clone()
+    rz_old = _dots(r, z)  # (k,); equals ||r||^2 when unpreconditioned
     zero = torch.zeros((), dtype=b.dtype, device=b.device)
     one = torch.ones((), dtype=b.dtype, device=b.device)
 
@@ -125,18 +131,20 @@ def solve_cg(
             # column; the column is frozen (alpha = 0, p kept) so the final
             # residual check decides, mirroring the original early break.
             ok = pAp > 0.0
-            alpha = torch.where(ok, rs_old / torch.where(ok, pAp, one), zero)
+            alpha = torch.where(ok, rz_old / torch.where(ok, pAp, one), zero)
             x = x + alpha * p
             r = r - alpha * Ap
 
-            rs_new = _dots(r, r)
-            pos = rs_old > 0.0
-            beta = torch.where(pos, rs_new / torch.where(pos, rs_old, one), zero)
-            p = torch.where(ok, r + beta * p, p)
-            rs_old = rs_new
+            z = r if M is None else M * r
+            rz_new = _dots(r, z)
+            rr = rz_new if M is None else _dots(r, r)
+            pos = rz_old > 0.0
+            beta = torch.where(pos, rz_new / torch.where(pos, rz_old, one), zero)
+            p = torch.where(ok, z + beta * p, p)
+            rz_old = rz_new
 
             if it % check_every == 0 or it == maxiter:
-                still_running = ok & (rs_new > tol_sq)
+                still_running = ok & (rr > tol_sq)
                 if not bool(still_running.any()):
                     break
 

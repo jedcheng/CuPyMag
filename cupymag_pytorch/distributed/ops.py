@@ -100,6 +100,9 @@ def solve_cg(
     if single_rhs:
         b = b.unsqueeze(1)
 
+    if M is not None and M.dim() == 1:
+        M = M.unsqueeze(1)  # inverse diagonal, broadcast over RHS columns
+
     if use_init and x0 is not None:
         x = x0.detach().clone().to(A.t.device).to(b.dtype)
         if x.dim() == 1:
@@ -113,18 +116,23 @@ def solve_cg(
     one = torch.ones((), dtype=b.dtype, device=b.device)
 
     r = b.clone() if cold else b - (A @ x)
-    w = A @ r
+    u = r if M is None else M * r
+    w = A @ u
 
-    # One fused reduction for ||b||^2, gamma = (r,r), delta = (w,r).
-    buf = torch.stack(
-        [
-            torch.einsum("nk,nk->k", b, b),
-            torch.einsum("nk,nk->k", r, r),
-            torch.einsum("nk,nk->k", w, r),
-        ]
-    )
-    dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-    b_norm_sq, gamma, delta = buf[0], buf[1], buf[2]
+    # One fused reduction for ||b||^2, gamma = (r,u), delta = (w,u) and,
+    # when preconditioned, the true residual norm rr = (r,r).
+    def _fused(*pairs):
+        buf = torch.stack([torch.einsum("nk,nk->k", a, c) for a, c in pairs])
+        dist.all_reduce(buf, op=dist.ReduceOp.SUM)
+        return buf
+
+    if M is None:
+        buf = _fused((b, b), (r, u), (w, u))
+        b_norm_sq, gamma, delta = buf[0], buf[1], buf[2]
+        rr = gamma
+    else:
+        buf = _fused((b, b), (r, u), (w, u), (r, r))
+        b_norm_sq, gamma, delta, rr = buf[0], buf[1], buf[2], buf[3]
 
     tol_sq = (tol * tol) * b_norm_sq
     nonzero = b_norm_sq > 0.0
@@ -154,24 +162,24 @@ def solve_cg(
                 alpha = torch.where(ok, gamma / torch.where(ok, denom, one), zero)
 
             # Frozen columns (ok == False) keep p, s, x, r unchanged.
-            p = torch.where(ok, r + beta * p, p)
+            p = torch.where(ok, u + beta * p, p)
             s = torch.where(ok, w + beta * s, s)  # s = A p by recurrence
             x = x + alpha * p
             r = r - alpha * s
 
-            w = A @ r
+            u = r if M is None else M * r
+            w = A @ u
             gamma_prev = gamma
-            buf = torch.stack(
-                [
-                    torch.einsum("nk,nk->k", r, r),
-                    torch.einsum("nk,nk->k", w, r),
-                ]
-            )
-            dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-            gamma, delta = buf[0], buf[1]
+            if M is None:
+                buf = _fused((r, u), (w, u))
+                gamma, delta = buf[0], buf[1]
+                rr = gamma
+            else:
+                buf = _fused((r, u), (w, u), (r, r))
+                gamma, delta, rr = buf[0], buf[1], buf[2]
 
             if it % check_every == 0 or it == maxiter:
-                still_running = ok & (gamma > tol_sq)
+                still_running = ok & (rr > tol_sq)
                 if not bool(still_running.any()):
                     break
 

@@ -76,6 +76,15 @@ def main():
     A_el, F_el = SimOp.csr_elasticity()
     Avg = SimOp.volume_average()
 
+    # Optional Jacobi (inverse-diagonal) preconditioners.
+    if cg_preconditioner == "jacobi":
+        Mj_demag = 1.0 / A_demag.diagonal()
+        Mj_A1 = 1.0 / A1.diagonal()
+        Mj_A2 = 1.0 / A2.diagonal()
+        Mj_el = 1.0 / A_el.diagonal() if ME else None
+    else:
+        Mj_demag = Mj_A1 = Mj_A2 = Mj_el = None
+
     # Initialize magnetization
     DefDOF = SimOp.DefDOF
     nDOF = SimOp.n_dof
@@ -140,6 +149,7 @@ def main():
                 A_el,
                 b_el,
                 x0=u,
+                M=Mj_el,
                 tol=tol,
                 maxiter=maxiter,
                 system="elasticity",
@@ -196,6 +206,7 @@ def main():
             A_demag,
             b_demag,
             x0=U,
+            M=Mj_demag,
             tol=tol,
             maxiter=maxiter,
             system="demag",
@@ -286,6 +297,7 @@ def main():
             A1,
             b_g1n,
             x0=g1n,
+            M=Mj_A1,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel g1n",
@@ -296,6 +308,7 @@ def main():
             A1,
             b_g2n,
             x0=g2n,
+            M=Mj_A1,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel g2n",
@@ -306,6 +319,7 @@ def main():
             A1,
             b_g3n,
             x0=g3n,
+            M=Mj_A1,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel g3n",
@@ -320,6 +334,7 @@ def main():
             A1,
             b_gstar,
             x0=g1star,
+            M=Mj_A1,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel g1star",
@@ -334,6 +349,7 @@ def main():
             A1,
             b_gstar,
             x0=g2star,
+            M=Mj_A1,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel g2star",
@@ -416,6 +432,7 @@ def main():
             A2,
             b_gstar,
             x0=m1starstar,
+            M=Mj_A2,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel m1starstar",
@@ -428,6 +445,7 @@ def main():
             A2,
             b_gstar,
             x0=m2starstar,
+            M=Mj_A2,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel m2starstar",
@@ -440,6 +458,7 @@ def main():
             A2,
             b_gstar,
             x0=m3starstar,
+            M=Mj_A2,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel m3starstar",

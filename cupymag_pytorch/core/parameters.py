@@ -149,6 +149,11 @@ use_init_factor = solver["initial_factor"]
 # (up to N-1 overshoot iterations past convergence; reduces host syncs,
 # which matters on GPU).
 cg_check_every = int(solver.get("check_every", 1))
+# CG preconditioner: "none" or "jacobi" (inverse-diagonal scaling;
+# communication-free, mainly useful on non-uniform/Tet meshes).
+cg_preconditioner = str(solver.get("preconditioner", "none")).lower()
+if cg_preconditioner not in ("none", "jacobi"):
+    raise ValueError(f"Unknown solver.preconditioner: {cg_preconditioner}")
 
 restart = sim.get("restart", False)
 restart_m = sim.get("restart_magnetization", None)

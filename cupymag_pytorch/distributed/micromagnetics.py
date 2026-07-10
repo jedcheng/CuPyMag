@@ -201,12 +201,35 @@ def main():
     A1 = DistSparseMat.from_scipy_global(A1_sp, part)
     A2 = DistSparseMat.from_scipy_global(A2_sp, part)
     F1 = DistSparseMat.from_scipy_global(F1_sp, part)
+
+    # Optional Jacobi (inverse-diagonal) preconditioners, local rows.
+    def _inv_diag_local(sp_mat):
+        return torch.as_tensor(
+            1.0 / sp_mat.diagonal()[part.r0 : part.r1], dtype=float_cp, device=DEVICE
+        )
+
+    if cg_preconditioner == "jacobi":
+        Mj_demag = _inv_diag_local(A_demag_sp)
+        Mj_A1 = _inv_diag_local(A1_sp)
+        Mj_A2 = _inv_diag_local(A2_sp)
+    else:
+        Mj_demag = Mj_A1 = Mj_A2 = Mj_el = None
     del A_demag_sp, Fx_sp, Fy_sp, Fz_sp, A1_sp, A2_sp, F1_sp
 
     if ME:
         A_el_sp, F_el_sp = _assemble_elasticity_scipy(mesh)
         A_el = DistBlockMat.from_scipy_global(A_el_sp, part)
         F_el = DistFMat.from_scipy_global(F_el_sp, part)
+        if cg_preconditioner == "jacobi":
+            d3 = A_el_sp.diagonal()
+            Mj_el = torch.as_tensor(
+                1.0
+                / np.concatenate(
+                    [d3[c * nDOF + part.r0 : c * nDOF + part.r1] for c in range(3)]
+                ),
+                dtype=float_cp,
+                device=DEVICE,
+            )
         del A_el_sp, F_el_sp
 
     Avg = DistVolumeAverage(
@@ -314,6 +337,7 @@ def main():
                 A_el,
                 b_el,
                 x0=u,
+                M=Mj_el,
                 tol=tol,
                 maxiter=maxiter,
                 system="elasticity",
@@ -375,6 +399,7 @@ def main():
             A_demag,
             b_demag,
             x0=U,
+            M=Mj_demag,
             tol=tol,
             maxiter=maxiter,
             system="demag",
@@ -470,6 +495,7 @@ def main():
             A1,
             B_gn,
             x0=Gn,
+            M=Mj_A1,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel g1n/g2n/g3n",
@@ -485,6 +511,7 @@ def main():
             A1,
             b_gstar,
             x0=g1star,
+            M=Mj_A1,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel g1star",
@@ -499,6 +526,7 @@ def main():
             A1,
             b_gstar,
             x0=g2star,
+            M=Mj_A1,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel g2star",
@@ -583,6 +611,7 @@ def main():
             A2,
             B_ss,
             x0=Mss,
+            M=Mj_A2,
             tol=tol,
             maxiter=maxiter,
             system="Gauss-Seidel m*starstar",

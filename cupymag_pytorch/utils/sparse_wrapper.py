@@ -86,6 +86,17 @@ class SparseMat:
     def shape(self):
         return self.t.shape
 
+    def diagonal(self):
+        """Return the main diagonal as a dense 1-D tensor."""
+        coo = self.t.to_sparse_coo().coalesce()
+        idx = coo.indices()
+        mask = idx[0] == idx[1]
+        d = torch.zeros(
+            min(self.shape), dtype=coo.values().dtype, device=coo.values().device
+        )
+        d[idx[0][mask]] = coo.values()[mask]
+        return d
+
     def matmul(self, v):
         if not isinstance(v, torch.Tensor):
             v = torch.as_tensor(v, device=self.t.device, dtype=self.t.dtype)
