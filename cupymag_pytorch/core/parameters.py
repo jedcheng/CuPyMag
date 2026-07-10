@@ -195,6 +195,9 @@ write_m = output.get("write_magnetization", True)
 output_dir = config_loader.get_output_dir()
 save_frequency = int(output.get("save_frequency", 1000))
 vtu_alpha = output.get("vtu_blend_alpha", 0.05)
+# Distributed backend only: write per-rank .vtu pieces + a .pvtu index
+# instead of gathering fields to rank 0 for VTU output.
+parallel_vtu = bool(output.get("parallel_vtu", False))
 
 _validate_parameters(ms, ld, timestep, AA_raw, alpha_damp)
 

@@ -405,6 +405,136 @@ class DistVolumeAverage(VolumeAverage):
 
     def write_to_paraview(self, *args, **kwargs):
         raise NotImplementedError(
-            "Use a serial VolumeAverage on rank 0 with gathered fields for "
-            "VTU output (Phase 1)."
+            "Use a serial VolumeAverage on rank 0 with gathered fields, or "
+            "write_to_paraview_parallel for per-rank .pvtu pieces."
         )
+
+    def write_to_paraview_parallel(self, field_dict, filename, alpha=0.5, eps=1e-14):
+        """Write this rank's element slice as a .vtu piece plus (rank 0) a
+        .pvtu index referencing all pieces — no field gather needed.
+
+        ``field_dict`` values are rank-local DOF fields (n_own,) or
+        (n_own, C). Mirrors the serial ``write_to_paraview`` (including
+        nodal/cell blending) restricted to the local piece; nodal/cell
+        blending and periodic-DOF averaging are evaluated per piece, so
+        values at rank-boundary nodes can differ slightly from a serial
+        write (visualization only).
+        """
+        import meshio
+        import numpy as np
+        from scipy.sparse import coo_matrix
+
+        from cupymag_pytorch.utils.backend import to_np
+
+        part = self.part
+        rank, P = part.rank, part.world_size
+        n_per_elem = self.n_nodes_per_elem
+
+        cells_glob = to_np(self.elements)[:, :n_per_elem].astype(np.int64)
+        piece_nodes, cells = np.unique(cells_glob, return_inverse=True)
+        cells = cells.reshape(cells_glob.shape)
+        coords = to_np(self.coords)[piece_nodes]
+        gid = to_np(self.original_global_id).astype(np.int64)[piece_nodes]
+
+        # DOF value lookup: piece node -> ghost-extended local index.
+        node_ext = np.asarray(part._remap_right)[gid]
+
+        n_nodes, n_elems = coords.shape[0], cells.shape[0]
+        N_g = to_np(self.N_gauss_gpu)
+        W_g = to_np(self.W_gauss_gpu)
+        detJ = to_np(self.detJ)
+        cDOF = node_ext[cells]  # (e, n) ext indices per corner
+
+        row = cells.reshape(-1)
+        col = np.repeat(np.arange(n_elems), n_per_elem)
+        data = np.ones_like(row, dtype=np.float64)
+        A = coo_matrix((data, (row, col)), shape=(n_nodes, n_elems)).tocsr()
+        A_sum = np.asarray(A.sum(axis=1)).ravel()
+
+        uniq, inverse, counts = np.unique(gid, return_inverse=True, return_counts=True)
+        dof_inv_cnt = (1.0 / counts)[inverse][:, None]
+
+        point_data = {}
+        cell_data = {}
+
+        names = []
+        for name, f in field_dict.items():
+            f2 = f if f.dim() == 2 else f.reshape(-1, 1)
+            f_ext = to_np(part.extend_right(f2)).astype(np.float64)
+            nC = f_ext.shape[1]
+
+            node_val = f_ext[node_ext]  # (n_nodes, nC)
+
+            if alpha < 0.999:
+                f_e = f_ext[cDOF]  # (e, n, C)
+                F_e_g = np.tensordot(f_e, N_g, axes=(1, 1)).transpose(0, 2, 1)
+                weight = detJ * W_g
+
+                num = np.einsum("eg,egc->ec", weight, F_e_g)
+                den = weight.sum(axis=1, keepdims=True)
+
+                elem_val = np.where(den > eps, num / den, f_e.mean(axis=1))
+
+                cc_val = A @ elem_val
+                cc_val = np.where(A_sum[:, None] > 0, cc_val / A_sum[:, None], node_val)
+
+                buf = np.zeros((uniq.size, nC), dtype=cc_val.dtype)
+                np.add.at(buf, inverse, cc_val)
+                cc_val = buf[inverse] * dof_inv_cnt
+
+                node_val = alpha * node_val + (1.0 - alpha) * cc_val
+
+            if nC == 1:
+                point_data[name] = node_val[:, 0]
+                names.append(name)
+            else:
+                for c in range(nC):
+                    point_data[f"{name}_{c + 1}"] = node_val[:, c]
+                    names.append(f"{name}_{c + 1}")
+
+        cell_data["defect_flag"] = [to_np(self.defect_flags).astype(np.int32)]
+
+        base = filename[: -len(".vtu")] if filename.endswith(".vtu") else filename
+        piece_file = f"{base}_p{rank}.vtu"
+        elem_type = {4: "tetra", 8: "hexahedron"}[n_per_elem]
+        meshio.write(
+            piece_file,
+            meshio.Mesh(
+                points=coords,
+                cells=[(elem_type, cells)],
+                point_data=point_data,
+                cell_data=cell_data,
+            ),
+        )
+
+        if rank == 0:
+            import os
+
+            arrays = "\n".join(
+                f'      <PDataArray type="Float64" Name="{n}"/>' for n in names
+            )
+            pieces = "\n".join(
+                f'    <Piece Source="{os.path.basename(base)}_p{r}.vtu"/>'
+                for r in range(P)
+            )
+            with open(f"{base}.pvtu", "w") as fh:
+                fh.write(
+                    '<?xml version="1.0"?>\n'
+                    '<VTKFile type="PUnstructuredGrid" version="0.1" '
+                    'byte_order="LittleEndian">\n'
+                    '  <PUnstructuredGrid GhostLevel="0">\n'
+                    "    <PPointData>\n"
+                    f"{arrays}\n"
+                    "    </PPointData>\n"
+                    "    <PCellData>\n"
+                    '      <PDataArray type="Int32" Name="defect_flag"/>\n'
+                    "    </PCellData>\n"
+                    "    <PPoints>\n"
+                    '      <PDataArray type="Float64" Name="Points" '
+                    'NumberOfComponents="3"/>\n'
+                    "    </PPoints>\n"
+                    f"{pieces}\n"
+                    "  </PUnstructuredGrid>\n"
+                    "</VTKFile>\n"
+                )
+            print(f"Field written to {base}.pvtu ({P} pieces).")

@@ -235,10 +235,11 @@ def main():
     Avg = DistVolumeAverage(
         mesh.node_coords_pt, mesh.elements_pt, mesh.global_id_pt, part
     )
-    # Serial averaging class on rank 0 for VTU output of gathered fields.
+    # Serial averaging class on rank 0 for VTU output of gathered fields
+    # (not needed when writing per-rank .pvtu pieces).
     AvgOut = (
         VolumeAverage(mesh.node_coords_pt, mesh.elements_pt, mesh.global_id_pt)
-        if root
+        if root and not parallel_vtu
         else None
     )
 
@@ -282,7 +283,32 @@ def main():
         hyst_file.write("Hext1\tHext2\tHext3\tavg_m1\tavg_m2\tavg_m3\n")
 
     def write_outputs(Htilde1, Htilde2, Htilde3, E, count):
-        """Gather fields and write VTU / h5 on rank 0 (collective)."""
+        """Write VTU (gathered on rank 0, or per-rank .pvtu pieces) and the
+        restart h5 (always gathered — global DOF order). Collective."""
+        vtu_name = os.path.join(output_dir, f"field_{Hext1 * ms:.0f}_{count}.vtu")
+        field_dict = lambda mm, h1, h2, h3, ee: {
+            "Htilde1": h1,
+            "Htilde2": h2,
+            "Htilde3": h3,
+            "m1": mm[:, 0],
+            "m2": mm[:, 1],
+            "m3": mm[:, 2],
+            "E11": ee[:, 0],
+            "E22": ee[:, 1],
+            "E33": ee[:, 2],
+            "E12": ee[:, 3],
+            "E23": ee[:, 4],
+            "E13": ee[:, 5],
+        }
+        if parallel_vtu:
+            Avg.write_to_paraview_parallel(
+                field_dict(m, Htilde1, Htilde2, Htilde3, E), vtu_name, alpha=vtu_alpha
+            )
+            if write_m:
+                m_g = part.gather_rows(m)
+                if root:
+                    write_array(m_g, os.path.join(output_dir, "last_m.h5"))
+            return
         m_g = part.gather_rows(m)
         Ht1_g = part.gather_rows(Htilde1)
         Ht2_g = part.gather_rows(Htilde2)
@@ -290,21 +316,8 @@ def main():
         E_g = part.gather_rows(E)
         if root:
             AvgOut.write_to_paraview(
-                {
-                    "Htilde1": Ht1_g,
-                    "Htilde2": Ht2_g,
-                    "Htilde3": Ht3_g,
-                    "m1": m_g[:, 0],
-                    "m2": m_g[:, 1],
-                    "m3": m_g[:, 2],
-                    "E11": E_g[:, 0],
-                    "E22": E_g[:, 1],
-                    "E33": E_g[:, 2],
-                    "E12": E_g[:, 3],
-                    "E23": E_g[:, 4],
-                    "E13": E_g[:, 5],
-                },
-                os.path.join(output_dir, f"field_{Hext1 * ms:.0f}_{count}.vtu"),
+                field_dict(m_g, Ht1_g, Ht2_g, Ht3_g, E_g),
+                vtu_name,
                 alpha=vtu_alpha,
             )
             if write_m:
